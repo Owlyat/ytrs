@@ -1,10 +1,13 @@
 use core::panic;
+use ratatui::{
+    crossterm::event::{Event, KeyCode, KeyEvent, read},
+    widgets::Paragraph,
+};
 use rustypipe::{
     client::RustyPipe,
-    model::{TrackItem, traits::YtEntity},
-    param::StreamFilter,
+    model::{SearchResult, TrackItem, VideoItem, traits::YtEntity},
 };
-use std::{path::PathBuf, process::Command};
+use std::{path::PathBuf, thread};
 use yt_dlp::{Youtube, fetcher::deps::Libraries};
 
 #[tokio::main]
@@ -19,13 +22,13 @@ pub enum YTRSAction {
     #[default]
     None,
     Ytdlp {
-        yt_query: YtQuery,
+        yt_query: YtMusicQuery,
     },
     Watch {
-        yt_query: YtQuery,
+        yt_query: YTQuery,
     },
     Listen {
-        yt_query: YtQuery,
+        yt_query: YtMusicQuery,
     },
 }
 impl YTRSAction {
@@ -46,35 +49,79 @@ impl YTRSAction {
         }
     }
     async fn watch(&mut self) {
-        *self = Self::Watch {
-            yt_query: YtQuery::new().await,
-        };
-        let rp = RustyPipe::new();
-        let player = rp.query().player(self.get_id().unwrap()).await.unwrap();
-        let (video, audio) = player.select_video_audio_stream(&StreamFilter::default());
-        let mut args = vec![video.expect("No Video Stream").url.to_owned()];
-        if let Some(audio) = audio {
-            args.push(format!("--audio-file={}", audio.url));
-        }
-        if Command::new("mpv").args(["--version"]).output().is_ok() {
-            Command::new("mpv").args(args).output().unwrap();
-        } else {
-            panic!("MPV not installed")
+        loop {
+            *self = Self::Watch {
+                yt_query: YTQuery::from(inquire::Text::new("Query :").prompt().unwrap().as_str())
+                    .await,
+            };
+            if let Self::Watch { yt_query } = self {
+                if std::process::Command::new("mpv")
+                    .args(["--version"])
+                    .output()
+                    .is_ok()
+                {
+                    std::process::Command::new("mpv")
+                        .arg(format!(
+                            "https://www.youtube.com/watch?v={}",
+                            yt_query.video.id
+                        ))
+                        .output()
+                        .unwrap();
+                } else {
+                    panic!("MPV not installed")
+                }
+            }
         }
     }
     async fn listen(&mut self) {
-        *self = Self::Listen {
-            yt_query: YtQuery::new().await,
-        };
-        let url = &format!("https://www.youtube.com/watch?v={}", self.get_id().unwrap());
+        loop {
+            if let Ok(yt_query) = YtMusicQuery::new_music_search().await {
+                *self = Self::Listen { yt_query }
+            } else {
+                break;
+            }
+            // Thread to run command
+            let url = format!(
+                "https://www.youtube.com/watch?v={}",
+                self.get_id().clone().unwrap()
+            );
+            let handle = thread::spawn(move || {
+                if std::process::Command::new("mpv")
+                    .args(["--version"])
+                    .output()
+                    .is_ok()
+                {
+                    std::process::Command::new("mpv")
+                        .args(["--no-video", url.as_str()])
+                        .output()
+                        .unwrap();
+                } else {
+                    panic!("MPV not installed")
+                }
+            });
+            let mut term = ratatui::init();
 
-        if Command::new("mpv").args(["--version"]).output().is_ok() {
-            Command::new("mpv")
-                .args(["--no-video", url])
-                .output()
-                .unwrap();
-        } else {
-            panic!("MPV not installed")
+            'playing: loop {
+                if handle.is_finished() {
+                    ratatui::restore();
+                    break 'playing;
+                } else {
+                    term.draw(|f| {
+                        f.render_widget(Paragraph::new("Press <q> to terminate"), f.area())
+                    })
+                    .unwrap();
+                    if let Ok(Event::Key(KeyEvent { code, .. })) = read() {
+                        if code == KeyCode::Char('q') {
+                            ratatui::restore();
+                            std::process::Command::new("Taskkill")
+                                .args(["/f", "/im", "mpv.exe"])
+                                .output()
+                                .unwrap();
+                            break 'playing;
+                        }
+                    }
+                }
+            }
         }
     }
     async fn yt_dlp(&mut self) {
@@ -86,9 +133,9 @@ impl YTRSAction {
             .unwrap()
         {
             "Download" => {
-                *self = Self::Ytdlp {
-                    yt_query: YtQuery::new().await,
-                };
+                if let Ok(yt_query) = YtMusicQuery::new_music_search().await {
+                    *self = Self::Ytdlp { yt_query };
+                }
                 let url = &format!("https://www.youtube.com/watch?v={}", self.get_id().unwrap());
 
                 let ytdlp = libraries_dir.join("yt-dlp");
@@ -220,12 +267,14 @@ impl YTRSAction {
     }
 }
 
-pub struct YtQuery {
+pub struct YtMusicQuery {
     video: TrackItem,
 }
-impl YtQuery {
-    async fn new() -> Self {
-        let search_term = inquire::Text::new("Youtube Search :").prompt().unwrap();
+impl YtMusicQuery {
+    async fn new_music_search() -> Result<Self, ()> {
+        let search_term = inquire::Text::new("Youtube Search :")
+            .prompt()
+            .expect("No search term");
         let rp = RustyPipe::new();
         let found_videos = rp
             .query()
@@ -233,24 +282,62 @@ impl YtQuery {
             .music_search_tracks(search_term)
             .await
             .unwrap();
-        let selected_vid_str = inquire::Select::new(
-            "Select Music",
-            found_videos
-                .clone()
-                .items
-                .items
-                .into_iter()
-                .map(|x| x.name.to_string())
-                .collect(),
-        )
-        .prompt()
-        .unwrap();
-        let vid = found_videos
+        let mut found_videos_str: Vec<String> = found_videos
+            .clone()
+            .items
+            .items
+            .into_iter()
+            .map(|x| x.name.to_string())
+            .collect();
+        found_videos_str.push("Exit".to_owned());
+        let selected_vid_str = inquire::Select::new("Select Music", found_videos_str)
+            .prompt()
+            .unwrap();
+        if let Some(vid) = found_videos
             .items
             .items
             .into_iter()
             .find(|track| track.name() == selected_vid_str)
-            .unwrap();
-        Self { video: vid }
+        {
+            Ok(Self { video: vid })
+        } else {
+            Err(())
+        }
+    }
+}
+
+pub struct YTQuery {
+    video: VideoItem,
+}
+
+impl YTQuery {
+    pub async fn from(query: &str) -> Self {
+        let found_videos: SearchResult<VideoItem> = RustyPipe::new()
+            .query()
+            .unauthenticated()
+            .search(query)
+            .await
+            .expect("Error");
+
+        let mut videos: Vec<String> = found_videos
+            .items
+            .items
+            .iter()
+            .map(|v| format!("➡️ {}", v.name))
+            .collect();
+        videos.push("Exit".to_owned());
+        if let Ok(video_name) = inquire::Select::new("Select video to watch", videos).prompt() {
+            let selected_vid = found_videos
+                .items
+                .items
+                .into_iter()
+                .find(|v| video_name.contains(&v.name));
+            if let Some(vid) = selected_vid {
+                return Self { video: vid };
+            }
+        } else {
+            // Error
+        }
+        panic!()
     }
 }
