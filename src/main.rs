@@ -5,7 +5,7 @@ use ratatui::{
 };
 use rustypipe::{
     client::RustyPipe,
-    model::{SearchResult, TrackItem, VideoItem, traits::YtEntity},
+    model::{TrackItem, VideoItem, traits::YtEntity},
 };
 use std::{path::PathBuf, thread};
 use yt_dlp::{Youtube, fetcher::deps::Libraries};
@@ -29,6 +29,7 @@ pub enum YTRSAction {
     },
     Listen {
         yt_query: YtMusicQuery,
+        search_term: Option<String>,
     },
 }
 impl YTRSAction {
@@ -50,23 +51,67 @@ impl YTRSAction {
     }
     async fn watch(&mut self) {
         loop {
-            *self = Self::Watch {
-                yt_query: YTQuery::from(inquire::Text::new("Query :").prompt().unwrap().as_str())
-                    .await,
-            };
+            if let Ok(query) = inquire::Text::new("Query :")
+                .with_help_message("Press Escape to exit")
+                .prompt()
+            {
+                match YTQuery::from(query.as_str()).await {
+                    Ok(yt) => {
+                        *self = Self::Watch { yt_query: yt };
+                    }
+                    Err(e) => panic!("{}", e),
+                }
+            } else {
+                std::process::exit(0);
+            }
             if let Self::Watch { yt_query } = self {
                 if std::process::Command::new("mpv")
                     .args(["--version"])
                     .output()
                     .is_ok()
                 {
-                    std::process::Command::new("mpv")
-                        .arg(format!(
-                            "https://www.youtube.com/watch?v={}",
-                            yt_query.video.id
-                        ))
-                        .output()
-                        .unwrap();
+                    let url = format!(
+                        "https://www.youtube.com/watch?v={}",
+                        yt_query.video.id.clone()
+                    );
+
+                    let handle = thread::spawn(move || {
+                        if std::process::Command::new("mpv")
+                            .args(["--version"])
+                            .output()
+                            .is_ok()
+                        {
+                            std::process::Command::new("mpv")
+                                .args([url.as_str()])
+                                .output()
+                                .unwrap();
+                        } else {
+                            panic!("MPV not installed")
+                        }
+                    });
+                    let mut term = ratatui::init();
+
+                    'playing: loop {
+                        if handle.is_finished() {
+                            ratatui::restore();
+                            break 'playing;
+                        } else {
+                            term.draw(|f| {
+                                f.render_widget(Paragraph::new("Press <q> to terminate"), f.area())
+                            })
+                            .unwrap();
+                            if let Ok(Event::Key(KeyEvent { code, .. })) = read() {
+                                if code == KeyCode::Char('q') {
+                                    ratatui::restore();
+                                    std::process::Command::new("Taskkill")
+                                        .args(["/f", "/im", "mpv.exe"])
+                                        .output()
+                                        .unwrap();
+                                    break 'playing;
+                                }
+                            }
+                        }
+                    }
                 } else {
                     panic!("MPV not installed")
                 }
@@ -75,8 +120,23 @@ impl YTRSAction {
     }
     async fn listen(&mut self) {
         loop {
-            if let Ok(yt_query) = YtMusicQuery::new_music_search().await {
-                *self = Self::Listen { yt_query }
+            if let Ok((yt_query, search_term)) = YtMusicQuery::new_music_search(
+                if let YTRSAction::Listen {
+                    yt_query: _,
+                    search_term,
+                } = self
+                {
+                    search_term.clone()
+                } else {
+                    None
+                },
+            )
+            .await
+            {
+                *self = Self::Listen {
+                    yt_query,
+                    search_term: Some(search_term),
+                }
             } else {
                 break;
             }
@@ -133,7 +193,7 @@ impl YTRSAction {
             .unwrap()
         {
             "Download" => {
-                if let Ok(yt_query) = YtMusicQuery::new_music_search().await {
+                if let Ok((yt_query, _)) = YtMusicQuery::new_music_search(None).await {
                     *self = Self::Ytdlp { yt_query };
                 }
                 let url = &format!("https://www.youtube.com/watch?v={}", self.get_id().unwrap());
@@ -166,7 +226,7 @@ impl YTRSAction {
                                 println!("✅ Video Downloaded at {}", path.to_string_lossy());
                             }
                             Err(e) => {
-                                println!("❌ Error downloading video {}", e);
+                                println!("❌ Error downloading video {e}");
                             }
                         }
                     }
@@ -190,7 +250,7 @@ impl YTRSAction {
                                 println!("✅ Audio Downloaded at {}", path.to_string_lossy());
                             }
                             Err(e) => {
-                                println!("❌ Error while downloading audio {}", e);
+                                println!("❌ Error while downloading audio {e}");
                             }
                         }
                     }
@@ -210,7 +270,7 @@ impl YTRSAction {
                                 println!("✅ Video Downloaded at {}", path.to_string_lossy());
                             }
                             Err(e) => {
-                                println!("❌ Error while downloading Video {}", e);
+                                println!("❌ Error while downloading Video {e}");
                             }
                         }
                     }
@@ -240,7 +300,7 @@ impl YTRSAction {
                         println!("✅ Libs Installed Successfully");
                     }
                     Err(e) => {
-                        println!("❌ Error while Installing libraries, {}", e);
+                        println!("❌ Error while Installing libraries, {e}");
                     }
                 }
             }
@@ -252,7 +312,10 @@ impl YTRSAction {
             YTRSAction::None => {}
             YTRSAction::Ytdlp { yt_query } => return Ok(yt_query.video.id.clone()),
             YTRSAction::Watch { yt_query } => return Ok(yt_query.video.id.clone()),
-            YTRSAction::Listen { yt_query } => return Ok(yt_query.video.id.clone()),
+            YTRSAction::Listen {
+                yt_query,
+                search_term: _,
+            } => return Ok(yt_query.video.id.clone()),
         }
         Err(())
     }
@@ -261,7 +324,10 @@ impl YTRSAction {
             YTRSAction::None => (),
             YTRSAction::Ytdlp { yt_query } => return Ok(yt_query.video.name.clone()),
             YTRSAction::Watch { yt_query } => return Ok(yt_query.video.name.clone()),
-            YTRSAction::Listen { yt_query } => return Ok(yt_query.video.name.clone()),
+            YTRSAction::Listen {
+                yt_query,
+                search_term: _,
+            } => return Ok(yt_query.video.name.clone()),
         }
         Err(())
     }
@@ -271,37 +337,42 @@ pub struct YtMusicQuery {
     video: TrackItem,
 }
 impl YtMusicQuery {
-    async fn new_music_search() -> Result<Self, ()> {
-        let search_term = inquire::Text::new("Youtube Search :")
+    async fn new_music_search(last_search_term: Option<String>) -> Result<(Self, String), ()> {
+        if let Ok(search_term) = inquire::Text::new("Youtube Search :")
+            .with_help_message("Press Escape to exit")
+            .with_initial_value(&last_search_term.unwrap_or_default())
             .prompt()
-            .expect("No search term");
-        let rp = RustyPipe::new();
-        let found_videos = rp
-            .query()
-            .unauthenticated()
-            .music_search_tracks(search_term)
-            .await
-            .unwrap();
-        let mut found_videos_str: Vec<String> = found_videos
-            .clone()
-            .items
-            .items
-            .into_iter()
-            .map(|x| x.name.to_string())
-            .collect();
-        found_videos_str.push("Exit".to_owned());
-        let selected_vid_str = inquire::Select::new("Select Music", found_videos_str)
-            .prompt()
-            .unwrap();
-        if let Some(vid) = found_videos
-            .items
-            .items
-            .into_iter()
-            .find(|track| track.name() == selected_vid_str)
         {
-            Ok(Self { video: vid })
+            let rp = RustyPipe::new();
+            let found_videos = rp
+                .query()
+                .unauthenticated()
+                .music_search_tracks(search_term.clone())
+                .await
+                .unwrap();
+            let mut found_videos_str: Vec<String> = found_videos
+                .clone()
+                .items
+                .items
+                .into_iter()
+                .map(|x| x.name.to_string())
+                .collect();
+            found_videos_str.push("Exit".to_owned());
+            let selected_vid_str = inquire::Select::new("Select Music", found_videos_str)
+                .prompt()
+                .unwrap();
+            if let Some(vid) = found_videos
+                .items
+                .items
+                .into_iter()
+                .find(|track| track.name() == selected_vid_str)
+            {
+                Ok((Self { video: vid }, search_term))
+            } else {
+                Err(())
+            }
         } else {
-            Err(())
+            std::process::exit(0)
         }
     }
 }
@@ -311,33 +382,39 @@ pub struct YTQuery {
 }
 
 impl YTQuery {
-    pub async fn from(query: &str) -> Self {
-        let found_videos: SearchResult<VideoItem> = RustyPipe::new()
+    pub async fn from(query: &str) -> Result<Self, String> {
+        if let Ok(found_videos) = RustyPipe::new()
             .query()
             .unauthenticated()
             .search(query)
             .await
-            .expect("Error");
+        {
+            let mut videos: Vec<String> = found_videos
+                .items
+                .items
+                .iter()
+                .map(|v: &VideoItem| format!("➡️ {}", v.name))
+                .collect();
+            videos.push("Exit".to_owned());
 
-        let mut videos: Vec<String> = found_videos
-            .items
-            .items
-            .iter()
-            .map(|v| format!("➡️ {}", v.name))
-            .collect();
-        videos.push("Exit".to_owned());
-        if let Ok(video_name) = inquire::Select::new("Select video to watch", videos).prompt() {
-            let selected_vid = found_videos
-                .items
-                .items
-                .into_iter()
-                .find(|v| video_name.contains(&v.name));
-            if let Some(vid) = selected_vid {
-                return Self { video: vid };
+            if let Ok(video_name) = inquire::Select::new("Select video to watch", videos).prompt() {
+                let selected_vid = found_videos
+                    .items
+                    .items
+                    .into_iter()
+                    .find(|v| video_name.contains(&v.name));
+                if let Some(vid) = selected_vid {
+                    Ok(Self { video: vid })
+                } else if video_name == "Exit" {
+                    std::process::exit(0)
+                } else {
+                    return Err("Error, selected video not found".to_owned());
+                }
+            } else {
+                Err("Error while selecting a video".to_owned())
             }
         } else {
-            // Error
+            Err(String::from("Error with the Youtube Query"))
         }
-        panic!()
     }
 }
