@@ -1,20 +1,22 @@
 use anyhow::{Context, Result, bail};
 use inquire::{Confirm, Select, Text as InquireText, validator::Validation};
+use mpv_ipc::{MpvIpc, MpvSpawnOptions};
 use ratatui::{
-    crossterm::event::{Event, KeyCode, KeyEvent, poll, read},
+    crossterm::event::{Event, KeyCode, poll, read},
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::Span,
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 use rustypipe::{
     client::RustyPipe,
     model::{TrackItem, VideoItem, traits::YtEntity},
 };
+use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use yt_dlp::{Youtube, fetcher::deps::Libraries};
 
 #[derive(Error, Debug)]
@@ -35,56 +37,32 @@ pub enum YtrsError {
     PlaybackError(String),
 }
 
-struct MpvController {
-    process: Child,
+struct MpvPlayer {
+    mpv_ipc: MpvIpc,
 }
 
-impl MpvController {
+impl MpvPlayer {
     async fn new(audio_only: bool, url: &str) -> Result<Self> {
-        let mut args = vec!["--no-terminal"];
+        let opts = MpvSpawnOptions::default();
 
-        if audio_only {
-            args.push("--no-video");
-        }
+        let mut mpv = MpvIpc::spawn(&opts, audio_only)
+            .await
+            .context("Failed to spawn mpv process")?;
 
-        args.push(url);
+        // Load the media
+        mpv.send_command(json!(["loadfile", url]))
+            .await
+            .context("Failed to load media")?;
 
-        let process = Command::new("mpv")
-            .args(&args)
-            .spawn()
-            .context("Failed to spawn MPV process")?;
-
-        Ok(Self { process })
+        Ok(Self { mpv_ipc: mpv })
     }
 
-    async fn terminate(&mut self) {
-        let _ = self.process.kill().await;
-        let _ = self.process.wait().await;
+    async fn quit(&mut self) {
+        self.mpv_ipc.quit().await;
     }
 }
 
-impl Drop for MpvController {
-    fn drop(&mut self) {
-        if !cfg!(windows) {
-            if let Some(pid) = self.process.id() {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .output();
-            }
-        }
-        if cfg!(windows) {
-            if let Some(pid) = self.process.id() {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/f", "/pid", &pid.to_string()])
-                    .output();
-            } else {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/f", "/im", "mpv.exe"])
-                    .output();
-            }
-        }
-    }
-}
+const LOADING_FRAMES: &[&str] = &["-", "\\", "|", "/"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -93,12 +71,17 @@ async fn main() -> Result<()> {
 
 const ACTIONS: &[&str] = &["Watch", "Listen", "YT-DLP", "Exit"];
 
+pub enum Query {
+    YtQuery(YTQuery),
+    YtMusicQuery(YtMusicQuery),
+}
+
 #[derive(Default)]
 pub enum YTRSAction {
     #[default]
     None,
     Ytdlp {
-        yt_query: YtMusicQuery,
+        yt_query: Query,
     },
     Watch {
         yt_query: YTQuery,
@@ -107,6 +90,61 @@ pub enum YTRSAction {
         yt_query: YtMusicQuery,
         search_term: Option<String>,
     },
+}
+
+static mut MPV_CHECKED: bool = false;
+static mut MPV_INSTALLED: bool = false;
+
+fn check_mpv_installed() -> bool {
+    unsafe {
+        if MPV_CHECKED {
+            return MPV_INSTALLED;
+        }
+        MPV_CHECKED = true;
+    }
+    let output = std::process::Command::new("mpv")
+        .args(["--version"])
+        .output();
+    match output {
+        Ok(output) => {
+            let installed = output.status.success();
+            unsafe {
+                MPV_INSTALLED = installed;
+            }
+            installed
+        }
+        Err(_) => {
+            unsafe {
+                MPV_INSTALLED = false;
+            }
+            false
+        }
+    }
+}
+
+fn check_libs_installed() -> bool {
+    let libs_dir = PathBuf::from("libs");
+
+    // Check for yt-dlp
+    let ytdlp_exists = libs_dir.join("yt-dlp.exe").exists() || libs_dir.join("yt-dlp").exists();
+
+    // Check for ffmpeg (in any subdirectory)
+    let mut ffmpeg_exists = false;
+    if libs_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&libs_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let bin_path = entry.path().join("bin").join("ffmpeg.exe");
+                    if bin_path.exists() {
+                        ffmpeg_exists = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    ytdlp_exists && ffmpeg_exists
 }
 
 impl YTRSAction {
@@ -150,12 +188,14 @@ impl YTRSAction {
                 .prompt()
                 .context("Failed to read query input")?;
 
+            println!("Searching for: {}", query);
             match YTQuery::from(query.as_str()).await {
                 Ok(yt) => {
                     *self = Self::Watch { yt_query: yt };
                 }
                 Err(e) => {
-                    bail!("{}", e);
+                    eprintln!("Search failed: {}. Please try again.", e);
+                    continue;
                 }
             }
 
@@ -165,26 +205,21 @@ impl YTRSAction {
                     yt_query.video.id.clone()
                 );
 
-                let output = Command::new("mpv")
-                    .args(["--version"])
-                    .output()
-                    .await
-                    .context("Failed to check MPV version")?;
-
-                if !output.status.success() {
-                    bail!("MPV is not installed. Please install MPV to watch videos.");
+                if !check_mpv_installed() {
+                    bail!(
+                        "MPV is not installed or not in PATH.\n   Please install MPV to watch videos.\n   Windows: winget install mpv\n   macOS: brew install mpv\n   Linux: sudo apt install mpv"
+                    );
                 }
 
-                let mut mpv = MpvController::new(false, &url)
+                let mut mpv = MpvPlayer::new(false, &url)
                     .await
                     .context("Failed to start MPV")?;
                 self.watch_playback(&mut mpv).await?;
-                drop(mpv);
             }
         }
     }
 
-    async fn watch_playback(&mut self, mpv: &mut MpvController) -> Result<()> {
+    async fn watch_playback(&mut self, mpv: &mut MpvPlayer) -> Result<()> {
         let mut term = ratatui::init();
         let quit_style = Style::default()
             .bg(Color::Rgb(50, 50, 70))
@@ -194,62 +229,186 @@ impl YTRSAction {
             .bg(Color::Yellow)
             .fg(Color::Rgb(50, 50, 70))
             .add_modifier(Modifier::BOLD);
+        let status_style = Style::default()
+            .bg(Color::Rgb(40, 40, 60))
+            .fg(Color::LightCyan);
+
+        let mut loading_frame = 0;
+        let mut ipc_status = "Connecting to mpv...".to_string();
+        let mut playback_time = 0.0_f64;
+        let mut duration = 0.0_f64;
+
+        // Observe playback-time and duration for progress display
+        let time_rx = mpv.mpv_ipc.observe_prop::<f64>("playback-time", 0.0).await;
+        let duration_rx = mpv.mpv_ipc.observe_prop::<f64>("duration", 0.0).await;
 
         loop {
-            match mpv.process.try_wait() {
-                Ok(Some(status)) => {
-                    ratatui::restore();
-                    if !status.success() {
-                        bail!("MPV playback ended with error");
+            // Check if mpv is still running
+            if !mpv.mpv_ipc.running().await {
+                ratatui::restore();
+                println!("Playback finished.");
+                return Ok(());
+            } else {
+                let title = self.get_name().unwrap_or_default();
+
+                // Update playback time from observer
+                if let Ok(has_changed) = time_rx.has_changed() {
+                    if has_changed {
+                        playback_time = *time_rx.borrow();
                     }
-                    return Ok(());
                 }
-                Ok(None) => {
-                    term.draw(|f| {
-                        let area = f.area();
+
+                // Update duration from observer
+                if let Ok(has_changed) = duration_rx.has_changed() {
+                    if has_changed {
+                        duration = *duration_rx.borrow();
+                        if duration > 0.0 {
+                            ipc_status = "Playing!".to_string();
+                        } else {
+                            ipc_status = "Loading...".to_string();
+                        }
+                    }
+                }
+
+                // Check if media is ready (duration > 0 means we know the length)
+                let media_ready = duration > 0.0;
+
+                term.draw(|f| {
+                    let area = f.area();
+
+                    if !media_ready {
                         let popup_area = Rect::new(
                             area.x + (area.width as u16 / 4),
-                            area.y + area.height as u16 - 6,
+                            area.y + area.height as u16 / 2 - 4,
                             area.width as u16 / 2,
-                            5,
+                            8,
                         );
                         let block = Block::default()
-                            .title("⬛ Playback Control")
+                            .title("Starting MPV...")
                             .title_alignment(Alignment::Center)
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Yellow))
+                            .border_style(Style::default().fg(Color::Cyan))
                             .border_type(BorderType::Rounded)
                             .style(Style::default().bg(Color::Rgb(30, 30, 45)));
                         f.render_widget(block, popup_area);
+
                         let inner_area = popup_area.inner(ratatui::layout::Margin {
                             vertical: 1,
                             horizontal: 2,
                         });
-                        let text = Paragraph::new(Text::from(Line::from(vec![
-                            Span::styled("Press ", quit_style),
-                            Span::styled(" [ q ] ", key_style),
-                            Span::styled("to stop playback", quit_style),
-                        ])))
-                        .alignment(Alignment::Center);
-                        f.render_widget(text, inner_area);
-                    })
-                    .expect("Terminal draw crashed");
 
-                    if poll(Duration::from_millis(50))? {
-                        if let Ok(Event::Key(KeyEvent { code, .. })) = read() {
-                            if let KeyCode::Char(c) = code {
-                                if c == 'q' || c == 'Q' {
-                                    ratatui::restore();
-                                    mpv.terminate().await;
-                                    return Ok(());
-                                }
+                        let loading_line =
+                            Rect::new(inner_area.x, inner_area.y + 2, inner_area.width, 1);
+                        let loading_text =
+                            Paragraph::new(format!("{} Loading...", LOADING_FRAMES[loading_frame]))
+                                .style(status_style.add_modifier(Modifier::BOLD))
+                                .alignment(Alignment::Center);
+                        f.render_widget(loading_text, loading_line);
+
+                        let status_line =
+                            Rect::new(inner_area.x, inner_area.y + 3, inner_area.width, 1);
+                        let status_text = Paragraph::new(ipc_status.clone())
+                            .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                            .alignment(Alignment::Center);
+                        f.render_widget(status_text, status_line);
+                    } else {
+                        let popup_area = Rect::new(
+                            area.x + (area.width as u16 / 4),
+                            area.y + area.height as u16 - 7,
+                            area.width as u16 / 2,
+                            8,
+                        );
+                        let block = Block::default()
+                            .title("Now Playing")
+                            .title_alignment(Alignment::Center)
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan))
+                            .border_type(BorderType::Rounded)
+                            .style(Style::default().bg(Color::Rgb(30, 30, 45)));
+                        f.render_widget(block, popup_area);
+
+                        let inner_area = popup_area.inner(ratatui::layout::Margin {
+                            vertical: 1,
+                            horizontal: 2,
+                        });
+
+                        let title_area = Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
+                        let truncated_title = if title.len() > inner_area.width as usize {
+                            format!("{}...", &title[..inner_area.width as usize - 3])
+                        } else {
+                            title.clone()
+                        };
+                        let title_text = Paragraph::new(truncated_title)
+                            .style(status_style.add_modifier(Modifier::BOLD))
+                            .alignment(Alignment::Center);
+                        f.render_widget(title_text, title_area);
+
+                        // Format times as MM:SS
+                        let current_minutes = (playback_time as u64) / 60;
+                        let current_seconds = (playback_time as u64) % 60;
+                        let total_minutes = (duration as u64) / 60;
+                        let total_seconds = (duration as u64) % 60;
+                        let time_str = format!(
+                            "{:02}:{:02} / {:02}:{:02}",
+                            current_minutes, current_seconds, total_minutes, total_seconds
+                        );
+
+                        // Display time
+                        let time_area =
+                            Rect::new(inner_area.x, inner_area.y + 1, inner_area.width, 1);
+                        let time_text = Paragraph::new(time_str)
+                            .style(Style::default().fg(Color::LightCyan))
+                            .alignment(Alignment::Center);
+                        f.render_widget(time_text, time_area);
+
+                        // Draw progress gauge
+                        let gauge_area =
+                            Rect::new(inner_area.x, inner_area.y + 2, inner_area.width, 1);
+                        let progress = if duration > 0.0 {
+                            (playback_time / duration).min(1.0).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let gauge_width = inner_area.width.saturating_sub(2);
+                        let filled_width = (gauge_width as f64 * progress) as u16;
+                        let _empty_width = gauge_width.saturating_sub(filled_width);
+
+                        let gauge = ratatui::widgets::Gauge::default()
+                            .ratio(progress as f64)
+                            .gauge_style(Style::default().fg(Color::Yellow))
+                            .style(Style::default().fg(Color::DarkGray))
+                            .label("");
+                        f.render_widget(gauge, gauge_area);
+
+                        let quit_area =
+                            Rect::new(inner_area.x, inner_area.y + 5, inner_area.width, 1);
+                        let quit_text = Paragraph::new(ratatui::text::Text::from(
+                            ratatui::text::Line::from(vec![
+                                Span::styled("Press ", quit_style),
+                                Span::styled(" [ q ] ", key_style),
+                                Span::styled("to stop", quit_style),
+                            ]),
+                        ))
+                        .alignment(Alignment::Center);
+                        f.render_widget(quit_text, quit_area);
+                    }
+                })
+                .expect("Terminal draw crashed");
+
+                loading_frame = (loading_frame + 1) % LOADING_FRAMES.len();
+
+                if poll(Duration::from_millis(100))? {
+                    if let Ok(Event::Key(key_event)) = read() {
+                        match key_event.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                ratatui::restore();
+                                mpv.quit().await;
+                                println!("Playback stopped by user.");
+                                return Ok(());
                             }
+                            _ => {}
                         }
                     }
-                }
-                Err(e) => {
-                    ratatui::restore();
-                    bail!("Error waiting for MPV: {}", e);
                 }
             }
         }
@@ -281,125 +440,54 @@ impl YTRSAction {
 
             let url = format!("https://www.youtube.com/watch?v={}", self.get_id().unwrap());
 
-            let output = Command::new("mpv")
-                .args(["--version"])
-                .output()
-                .await
-                .context("Failed to check MPV version")?;
-
-            if !output.status.success() {
-                bail!("MPV is not installed. Please install MPV to listen to music.");
+            if !check_mpv_installed() {
+                bail!(
+                    "MPV is not installed or not in PATH.\n   Please install MPV to listen to music.\n   Windows: winget install mpv\n   macOS: brew install mpv\n   Linux: sudo apt install mpv"
+                );
             }
 
-            let mut mpv = MpvController::new(true, &url)
+            let mut mpv = MpvPlayer::new(true, &url)
                 .await
                 .context("Failed to start MPV")?;
             self.watch_playback(&mut mpv).await?;
-            drop(mpv);
         }
     }
 
     async fn yt_dlp(&mut self) -> Result<()> {
         let output_dir = PathBuf::from("output");
         let libraries_dir = PathBuf::from("libs");
+        let libs_installed = check_libs_installed();
 
-        match Select::new("Action", vec!["Download", "Update", "Install"])
+        // Build action options based on whether libs are installed
+        let actions = if libs_installed {
+            vec!["Download", "Update"]
+        } else {
+            vec!["Download", "Update", "Install"]
+        };
+
+        match Select::new("Action", actions)
             .with_page_size(6)
             .with_help_message("Type to filter | Arrow keys to navigate")
             .prompt()
             .context("Failed to display YT-DLP action menu")
         {
             Ok("Download") => {
-                let (yt_query, _) = match YtMusicQuery::new_music_search(None).await {
-                    Ok(result) => result,
-                    Err(_) => return Ok(()),
+                // For now, use YouTube Music search - can be extended for YouTube later
+                let yt_choice = vec!["Youtube", "Youtube Music"];
+                let res = match inquire::Select::new("Download from", yt_choice).prompt() {
+                    Ok(c) => c,
+                    Err(e) => panic!("{}", e.to_string()),
                 };
-                *self = Self::Ytdlp { yt_query };
-                let url = &format!("https://www.youtube.com/watch?v={}", self.get_id().unwrap());
-
-                let ytdlp = libraries_dir.join("yt-dlp");
-                let ffmpeg = libraries_dir.join("ffmpeg");
-
-                let libraries = Libraries::new(ytdlp, ffmpeg);
-                let fetcher = Youtube::new(libraries, output_dir)
-                    .context("Failed to initialize YouTube downloader")?;
-
-                match Select::new("Download", vec!["All", "Audio-Only", "Video-Only"])
-                    .with_page_size(6)
-                    .with_help_message("Type to filter | Arrow keys to navigate")
-                    .prompt()
-                    .context("Failed to display download options")
-                {
-                    Ok("All") => {
-                        let extension =
-                            Select::new("Format", vec!["mp4", "webm", "avi", "mov", "mkv", "flv"])
-                                .with_page_size(8)
-                                .prompt()
-                                .context("Failed to select format")?;
-                        match fetcher
-                            .download_video_from_url(
-                                url.clone(),
-                                format!("{}.{}", self.get_name().unwrap(), extension),
-                            )
-                            .await
-                        {
-                            Ok(path) => {
-                                println!("Video Downloaded at {}", path.to_string_lossy());
-                            }
-                            Err(e) => {
-                                bail!("Error downloading video: {}", e);
-                            }
-                        }
+                match res {
+                    "Youtube" => {
+                        self.ytdlp_download(false, &output_dir, &libraries_dir)
+                            .await?;
                     }
-                    Ok("Audio-Only") => {
-                        let extension = Select::new(
-                            "Extension",
-                            vec![
-                                "mp3", "wav", "flac", "aac", "alac", "ogg", "m4a", "opus", "vorbis",
-                            ],
-                        )
-                        .with_page_size(8)
-                        .prompt()
-                        .context("Failed to select audio extension")?;
-                        match fetcher
-                            .download_video_from_url(
-                                url.clone(),
-                                format!("{}.{}", self.get_name().unwrap(), extension),
-                            )
-                            .await
-                        {
-                            Ok(path) => {
-                                println!("Audio Downloaded at {}", path.to_string_lossy());
-                            }
-                            Err(e) => {
-                                bail!("Error while downloading audio: {}", e);
-                            }
-                        }
+                    "Youtube Music" => {
+                        self.ytdlp_download(true, &output_dir, &libraries_dir)
+                            .await?;
                     }
-                    Ok("Video-Only") => {
-                        let extension = Select::new("Extension", vec!["mp4", "avi", "mov", "webm"])
-                            .with_page_size(6)
-                            .prompt()
-                            .context("Failed to select video extension")?;
-                        match fetcher
-                            .download_video_stream_from_url(
-                                url.clone(),
-                                format!("{}.{}", self.get_name().unwrap(), extension),
-                            )
-                            .await
-                        {
-                            Ok(path) => {
-                                println!("Video Downloaded at {}", path.to_string_lossy());
-                            }
-                            Err(e) => {
-                                bail!("Error while downloading Video: {}", e);
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        bail!("Download selection failed: {}", e);
-                    }
+                    _ => panic!("Should not happen"),
                 }
             }
             Ok("Update") => {
@@ -410,23 +498,76 @@ impl YTRSAction {
                 let fetcher = Youtube::new(libraries, output_dir);
 
                 if let Ok(ytdlp) = fetcher {
+                    println!("Checking for yt-dlp updates...");
                     if let Err(e) = ytdlp.update_downloader().await {
-                        bail!("Error while updating yt-dlp: {}", e);
+                        bail!(
+                            "Update failed: {}.\n   You may already have the latest version or no internet connection.",
+                            e
+                        );
                     }
+                    println!("yt-dlp updated successfully!");
                 } else {
-                    bail!("Failed to initialize downloader for update");
+                    bail!(
+                        "Failed to initialize downloader for update.\n   Make sure yt-dlp and ffmpeg are in the 'libs' directory."
+                    );
                 }
             }
             Ok("Install") => {
-                println!("Downloading Libs ...");
+                println!("Downloading yt-dlp and ffmpeg binaries...");
+                println!("   This may take a few minutes depending on your connection...");
 
-                let fetcher = Youtube::with_new_binaries(libraries_dir, output_dir).await;
+                std::fs::create_dir_all(&libraries_dir)
+                    .context("Failed to create libraries directory")?;
+                std::fs::create_dir_all(&output_dir)
+                    .context("Failed to create output directory")?;
+
+                let fetcher =
+                    Youtube::with_new_binaries(libraries_dir.clone(), output_dir.clone()).await;
                 match fetcher {
                     Ok(_) => {
-                        println!("Libs Installed Successfully");
+                        // Verify binaries actually exist
+                        let ytdlp_exists = libraries_dir.join("yt-dlp.exe").exists()
+                            || libraries_dir.join("yt-dlp").exists();
+                        let ffmpeg_exists = libraries_dir.join("ffmpeg.exe").exists()
+                            || libraries_dir.join("ffmpeg").exists()
+                            || libraries_dir.join("ffmpeg-release").exists();
+
+                        if ytdlp_exists && ffmpeg_exists {
+                            println!("Libraries installed successfully!");
+                            println!(
+                                "   yt-dlp and ffmpeg are now available in the 'libs' directory."
+                            );
+                        } else {
+                            println!(
+                                "Warning: Installation completed but some binaries may be missing."
+                            );
+                            if !ytdlp_exists {
+                                println!("   Missing: yt-dlp");
+                            }
+                            if !ffmpeg_exists {
+                                println!("   Missing: ffmpeg");
+                            }
+                        }
                     }
                     Err(e) => {
-                        bail!("Error while Installing libraries: {}", e);
+                        // Check if binaries exist despite error (partial success)
+                        let ytdlp_exists = libraries_dir.join("yt-dlp.exe").exists()
+                            || libraries_dir.join("yt-dlp").exists();
+                        let ffmpeg_exists = libraries_dir.join("ffmpeg.exe").exists()
+                            || libraries_dir.join("ffmpeg").exists()
+                            || libraries_dir.join("ffmpeg-release").exists();
+
+                        if ytdlp_exists && ffmpeg_exists {
+                            println!("Libraries installed successfully!");
+                            println!(
+                                "   yt-dlp and ffmpeg are now available in the 'libs' directory."
+                            );
+                        } else {
+                            bail!(
+                                "Installation failed: {}.\n   Please check your internet connection and try again.",
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -438,10 +579,291 @@ impl YTRSAction {
         Ok(())
     }
 
+    /// Find ffmpeg binary path dynamically
+    /// Searches: libs/ffmpeg.exe, libs/ffmpeg, libs/*/bin/ffmpeg.exe, libs/*/*/bin/ffmpeg.exe
+    fn find_ffmpeg_path(libraries_dir: &PathBuf) -> Result<PathBuf> {
+        // Check common locations
+        if libraries_dir.join("ffmpeg.exe").exists() {
+            return Ok(libraries_dir.join("ffmpeg.exe"));
+        }
+        if libraries_dir.join("ffmpeg").exists() {
+            return Ok(libraries_dir.join("ffmpeg"));
+        }
+        if libraries_dir
+            .join("ffmpeg-release")
+            .join("ffmpeg.exe")
+            .exists()
+        {
+            return Ok(libraries_dir.join("ffmpeg-release").join("ffmpeg.exe"));
+        }
+
+        // Search recursively for ffmpeg.exe
+        let mut ffmpeg_path = None;
+
+        // First level: libs/*/bin/ffmpeg.exe
+        if let Ok(entries) = std::fs::read_dir(libraries_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let bin_path = entry.path().join("bin").join("ffmpeg.exe");
+                    if bin_path.exists() {
+                        ffmpeg_path = Some(bin_path);
+                        break;
+                    }
+
+                    // Second level: libs/*/*/bin/ffmpeg.exe (for versioned directories)
+                    if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
+                        for sub_entry in sub_entries.flatten() {
+                            if sub_entry.path().is_dir() {
+                                let nested_bin = sub_entry.path().join("bin").join("ffmpeg.exe");
+                                if nested_bin.exists() {
+                                    ffmpeg_path = Some(nested_bin);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if ffmpeg_path.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        match ffmpeg_path {
+            Some(p) => Ok(p),
+            None => bail!("ffmpeg not found in libs directory. Searched: libs/ and subdirectories"),
+        }
+    }
+
+    /// Convert m4a to mp3 using ffmpeg with VBR quality (q:a 4)
+    async fn convert_m4a_to_mp3(
+        input_path: &PathBuf,
+        output_path: &PathBuf,
+        ffmpeg_path: &PathBuf,
+    ) -> Result<()> {
+        eprintln!("Converting to MP3 with VBR quality...");
+
+        let output = Command::new(ffmpeg_path)
+            .args(&[
+                "-i",
+                input_path.to_string_lossy().as_ref(),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "4",
+                output_path.to_string_lossy().as_ref(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .context("Failed to execute ffmpeg for conversion")?;
+
+        if output.status.success() {
+            // Remove the original m4a file
+            std::fs::remove_file(input_path)?;
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("FFmpeg conversion failed: {}", stderr);
+        }
+    }
+
+    async fn ytdlp_download(
+        &mut self,
+        yt_music: bool,
+        output_dir: &PathBuf,
+        libraries_dir: &PathBuf,
+    ) -> Result<(), anyhow::Error> {
+        // Search for video/music (using YouTube Music for now)
+        if yt_music {
+            let (yt_music_query, _) = YtMusicQuery::new_music_search(None).await?;
+            *self = Self::Ytdlp {
+                yt_query: Query::YtMusicQuery(yt_music_query),
+            };
+        } else {
+            let query = InquireText::new("Query:")
+                .with_help_message("Press Escape to cancel | Ctrl+C to exit")
+                .with_validator(|input: &str| {
+                    if input.trim().is_empty() {
+                        Ok(Validation::Invalid("Query cannot be empty".into()))
+                    } else if input.len() < 2 {
+                        Ok(Validation::Invalid(
+                            "Query too short (min 2 characters)".into(),
+                        ))
+                    } else {
+                        Ok(Validation::Valid)
+                    }
+                })
+                .prompt()
+                .context("Failed to read query input")?;
+
+            println!("Searching for: {}", query);
+            match YTQuery::from(query.as_str()).await {
+                Ok(yt) => {
+                    *self = Self::Ytdlp {
+                        yt_query: Query::YtQuery(yt),
+                    };
+                }
+                Err(e) => {
+                    panic!("Search failed: {}.", e);
+                }
+            }
+        }
+        let url = format!("https://www.youtube.com/watch?v={}", self.get_id().unwrap());
+
+        // Find yt-dlp binary (try both .exe and no extension)
+        let ytdlp = if libraries_dir.join("yt-dlp.exe").exists() {
+            libraries_dir.join("yt-dlp.exe")
+        } else if libraries_dir.join("yt-dlp").exists() {
+            libraries_dir.join("yt-dlp")
+        } else {
+            bail!("yt-dlp not found in libs directory");
+        };
+
+        // Find ffmpeg binary using dynamic search
+        let ffmpeg = Self::find_ffmpeg_path(libraries_dir)?;
+
+        let libraries = Libraries::new(ytdlp, ffmpeg);
+        let fetcher = Youtube::new(libraries, output_dir.clone())
+            .context("Failed to initialize YouTube downloader.\n   Make sure yt-dlp and ffmpeg are in the 'libs' directory.")?;
+        Ok(
+            match Select::new("Download", vec!["All", "Audio-Only", "Video-Only"])
+                .with_page_size(6)
+                .with_help_message("Type to filter | Arrow keys to navigate")
+                .prompt()
+                .context("Failed to display download options")
+            {
+                Ok("All") => {
+                    let extension =
+                        Select::new("Format", vec!["mp4", "webm", "avi", "mov", "mkv", "flv"])
+                            .with_page_size(8)
+                            .prompt()
+                            .context("Failed to select format")?;
+                    println!("Downloading video as {}...", extension);
+                    match fetcher
+                        .download_video_from_url(
+                            url.clone(),
+                            format!(
+                                "{}.{}",
+                                self.get_name().unwrap().replace(" ", "_"),
+                                extension
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(path) => {
+                            println!("Video downloaded successfully!");
+                            println!("📁 Location: {}", path.to_string_lossy());
+                        }
+                        Err(e) => {
+                            bail!(
+                                "Download failed: {}.\n   Please check your internet connection and try again.",
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok("Audio-Only") => {
+                    let extension = Select::new("Extension", vec!["mp3", "m4a"])
+                        .with_page_size(8)
+                        .prompt()
+                        .context("Failed to select audio extension")?;
+
+                    println!("Downloading audio as {}...", extension);
+
+                    // Find ffmpeg path for potential conversion
+                    let ffmpeg_convert_path = Self::find_ffmpeg_path(libraries_dir)?;
+
+                    // Download as m4a first (yt-dlp always outputs m4a for audio)
+                    let m4a_name = format!("{}.m4a", self.get_name().unwrap());
+
+                    match fetcher
+                        .download_audio_stream_from_url(url.clone(), m4a_name.clone())
+                        .await
+                    {
+                        Ok(path) => {
+                            // If user wanted mp3, convert from m4a
+                            if extension == "mp3" {
+                                let mp3_path = path.with_extension("mp3");
+                                match Self::convert_m4a_to_mp3(
+                                    &path,
+                                    &mp3_path,
+                                    &ffmpeg_convert_path,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        println!(
+                                            "Audio downloaded and converted to MP3 successfully!"
+                                        );
+                                        println!("📁 Location: {}", mp3_path.to_string_lossy());
+                                    }
+                                    Err(e) => {
+                                        // Keep the m4a if conversion fails
+                                        eprintln!(
+                                            "Warning: MP3 conversion failed: {}. Keeping m4a file.",
+                                            e
+                                        );
+                                        println!("Audio downloaded successfully (m4a)!");
+                                        println!("📁 Location: {}", path.to_string_lossy());
+                                    }
+                                }
+                            } else {
+                                // Rename to requested extension if different from m4a
+                                let final_path = path;
+                                println!("Audio downloaded successfully!");
+                                println!("📁 Location: {}", final_path.to_string_lossy());
+                            }
+                        }
+                        Err(e) => {
+                            bail!("Audio download failed: {}. Try m4a format.", e);
+                        }
+                    }
+                }
+                Ok("Video-Only") => {
+                    let extension = Select::new("Extension", vec!["mp4", "avi", "mov", "webm"])
+                        .with_page_size(6)
+                        .prompt()
+                        .context("Failed to select video extension")?;
+                    println!("Downloading video-only stream as {}...", extension);
+                    match fetcher
+                        .download_video_stream_from_url(
+                            url.clone(),
+                            format!("{}.{}", self.get_name().unwrap(), extension),
+                        )
+                        .await
+                    {
+                        Ok(path) => {
+                            println!("Video stream downloaded successfully!");
+                            println!("📁 Location: {}", path.to_string_lossy());
+                        }
+                        Err(e) => {
+                            bail!(
+                                "Video stream download failed: {}.\n   Please check your internet connection and try again.",
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    bail!("Download selection failed: {}", e);
+                }
+            },
+        )
+    }
+
     fn get_id(&self) -> Result<String> {
         match self {
-            YTRSAction::None => bail!("No video selected"),
-            YTRSAction::Ytdlp { yt_query } => Ok(yt_query.video.id.clone()),
+            YTRSAction::None => bail!("No video selected. Please search and select a video first."),
+            YTRSAction::Ytdlp { yt_query } => Ok(match yt_query {
+                Query::YtQuery(ytquery) => ytquery.video.id.clone(),
+                Query::YtMusicQuery(yt_music_query) => yt_music_query.video.id.clone(),
+            }),
             YTRSAction::Watch { yt_query } => Ok(yt_query.video.id.clone()),
             YTRSAction::Listen {
                 yt_query,
@@ -452,8 +874,11 @@ impl YTRSAction {
 
     fn get_name(&self) -> Result<String> {
         match self {
-            YTRSAction::None => bail!("No video selected"),
-            YTRSAction::Ytdlp { yt_query } => Ok(yt_query.video.name.clone()),
+            YTRSAction::None => bail!("No video selected. Please search and select a video first."),
+            YTRSAction::Ytdlp { yt_query } => Ok(match yt_query {
+                Query::YtQuery(ytquery) => ytquery.video.name.clone(),
+                Query::YtMusicQuery(yt_music_query) => yt_music_query.video.name.clone(),
+            }),
             YTRSAction::Watch { yt_query } => Ok(yt_query.video.name.clone()),
             YTRSAction::Listen {
                 yt_query,
@@ -485,6 +910,8 @@ impl YtMusicQuery {
             })
             .prompt()
             .context("Failed to read search input")?;
+
+        println!("Searching YouTube Music for: {}", search_term);
 
         let rp = RustyPipe::new();
         let found_videos = rp
@@ -521,7 +948,7 @@ impl YtMusicQuery {
         {
             Ok((Self { video: vid }, search_term))
         } else {
-            bail!("Selected video not found");
+            bail!("Selected music not found. Please try again.");
         }
     }
 }
@@ -532,6 +959,8 @@ pub struct YTQuery {
 
 impl YTQuery {
     pub async fn from(query: &str) -> Result<Self> {
+        println!("Searching YouTube for: {}", query);
+
         let found_videos = RustyPipe::new()
             .query()
             .unauthenticated()
@@ -542,7 +971,7 @@ impl YTQuery {
             .items
             .items
             .iter()
-            .map(|v: &VideoItem| format!("➡️ {}", v.name))
+            .map(|v: &VideoItem| format!("-> {}", v.name))
             .collect();
         videos.push("Exit".to_owned());
 
@@ -567,7 +996,7 @@ impl YTQuery {
         if let Some(vid) = selected_vid {
             Ok(Self { video: vid })
         } else {
-            bail!("Error: selected video not found");
+            bail!("Selected video not found. Please try again.");
         }
     }
 }

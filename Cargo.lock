@@ -1369,6 +1369,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4362c191039519815cacd68b16d1208d8678b4264b3e39ded01f471c71c37ffe"
 
 [[package]]
+name = "mpv-ipc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1926,7 +1938,7 @@ dependencies = [
  "serde_plain",
  "serde_with",
  "sha1",
- "thiserror 2.0.12",
+ "thiserror",
  "time",
  "tokio",
  "tracing",
@@ -2279,31 +2291,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "567b8a2dae586314f7be2a752ec7474332959c6460e02bde30d702a66d488708"
 dependencies = [
- "thiserror-impl 2.0.12",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -3144,21 +3136,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
- "thiserror 2.0.12",
+ "thiserror",
  "tokio",
  "uuid",
  "xz2",
  "zip",
-]
-
-[[package]]
-name = "ytd-rs"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "491153e7312fcd6bdcb33ac2ee2173ad318f784e766b4adb1a571b24d01165e9"
-dependencies = [
- "regex",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3167,12 +3149,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "inquire",
+ "mpv-ipc",
  "ratatui",
  "rustypipe",
- "thiserror 2.0.12",
+ "serde_json",
+ "thiserror",
  "tokio",
  "yt-dlp",
- "ytd-rs",
 ]
 
 [[package]]
