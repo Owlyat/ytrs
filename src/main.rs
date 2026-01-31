@@ -319,11 +319,9 @@ impl YTRSAction {
                         f.render_widget(status_text, status_line);
                     } else {
                         // Draw the thumbnail on top
-                        if let Some(thumbnail) = thumbnail {
-                            /* let image_widget = StatefulImage::default(); */
+                        if let Some(thumbnail) = &thumbnail {
                             let layout = Layout::vertical(Constraint::from_percentages([75, 25]))
                                 .split(area);
-                            /* f.render_stateful_widget(image_widget, layout[1], &mut thumbnail); */
                         }
                         let popup_area = Rect::new(
                             area.x + (area.width as u16 / 4),
