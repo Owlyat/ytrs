@@ -1,13 +1,15 @@
 use anyhow::{Context, Result, bail};
+use image::DynamicImage;
 use inquire::{Confirm, Select, Text as InquireText, validator::Validation};
 use mpv_ipc::{MpvIpc, MpvSpawnOptions};
 use ratatui::{
-    crossterm::event::{Event, KeyCode, poll, read},
-    layout::{Alignment, Rect},
+    crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, BorderType, Borders, Paragraph},
 };
+use ratatui_image::StatefulImage;
 use rustypipe::{
     client::RustyPipe,
     model::{TrackItem, VideoItem, traits::YtEntity},
@@ -214,12 +216,16 @@ impl YTRSAction {
                 let mut mpv = MpvPlayer::new(false, &url)
                     .await
                     .context("Failed to start MPV")?;
-                self.watch_playback(&mut mpv).await?;
+                self.watch_playback(&mut mpv, None).await?;
             }
         }
     }
 
-    async fn watch_playback(&mut self, mpv: &mut MpvPlayer) -> Result<()> {
+    async fn watch_playback(
+        &mut self,
+        mpv: &mut MpvPlayer,
+        thumbnail: Option<DynamicImage>,
+    ) -> Result<()> {
         let mut term = ratatui::init();
         let quit_style = Style::default()
             .bg(Color::Rgb(50, 50, 70))
@@ -312,6 +318,13 @@ impl YTRSAction {
                             .alignment(Alignment::Center);
                         f.render_widget(status_text, status_line);
                     } else {
+                        // Draw the thumbnail on top
+                        if let Some(thumbnail) = thumbnail {
+                            /* let image_widget = StatefulImage::default(); */
+                            let layout = Layout::vertical(Constraint::from_percentages([75, 25]))
+                                .split(area);
+                            /* f.render_stateful_widget(image_widget, layout[1], &mut thumbnail); */
+                        }
                         let popup_area = Rect::new(
                             area.x + (area.width as u16 / 4),
                             area.y + area.height as u16 - 7,
@@ -406,6 +419,22 @@ impl YTRSAction {
                                 println!("Playback stopped by user.");
                                 return Ok(());
                             }
+                            KeyCode::Left => {
+                                if key_event.kind == KeyEventKind::Press {
+                                    let _ = mpv
+                                        .mpv_ipc
+                                        .send_command(json!(["seek", "-5", "relative"]))
+                                        .await;
+                                }
+                            }
+                            KeyCode::Right => {
+                                if key_event.kind == KeyEventKind::Press {
+                                    let _ = mpv
+                                        .mpv_ipc
+                                        .send_command(json!(["seek", "5", "relative"]))
+                                        .await;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -438,7 +467,16 @@ impl YTRSAction {
                 search_term: Some(search_term),
             };
 
-            let url = format!("https://www.youtube.com/watch?v={}", self.get_id().unwrap());
+            let video_id = self.get_id().unwrap();
+            let url = format!("https://www.youtube.com/watch?v={video_id}");
+            let thumbnail_url = format!("https://img.youtube.com/vi/{video_id}/hqdefault.jpg");
+            let thumbnail_bytes = reqwest::Client::new()
+                .get(&thumbnail_url)
+                .send()
+                .await?
+                .bytes()
+                .await?;
+            let thumbnail = image::load_from_memory(&thumbnail_bytes)?;
 
             if !check_mpv_installed() {
                 bail!(
@@ -449,7 +487,7 @@ impl YTRSAction {
             let mut mpv = MpvPlayer::new(true, &url)
                 .await
                 .context("Failed to start MPV")?;
-            self.watch_playback(&mut mpv).await?;
+            self.watch_playback(&mut mpv, Some(thumbnail)).await?;
         }
     }
 
