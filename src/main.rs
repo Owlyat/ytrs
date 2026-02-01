@@ -3,16 +3,19 @@ use image::DynamicImage;
 use inquire::{Confirm, Select, Text as InquireText, validator::Validation};
 use mpv_ipc::{MpvIpc, MpvSpawnOptions};
 use ratatui::{
-    crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read},
+    crossterm::{
+        event::{Event, KeyCode, KeyEventKind, poll, read},
+        style::Stylize,
+    },
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, BorderType, Borders, Paragraph},
 };
-use ratatui_image::StatefulImage;
+use ratatui_image::{Image, picker};
 use rustypipe::{
     client::RustyPipe,
-    model::{TrackItem, VideoItem, traits::YtEntity},
+    model::{TrackItem, VideoItem},
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -216,7 +219,7 @@ impl YTRSAction {
                 let mut mpv = MpvPlayer::new(false, &url)
                     .await
                     .context("Failed to start MPV")?;
-                self.watch_playback(&mut mpv, None).await?;
+                self.watch_playback(&mut mpv, &mut None).await?;
             }
         }
     }
@@ -224,7 +227,7 @@ impl YTRSAction {
     async fn watch_playback(
         &mut self,
         mpv: &mut MpvPlayer,
-        thumbnail: Option<DynamicImage>,
+        thumbnail: &mut Option<DynamicImage>,
     ) -> Result<()> {
         let mut term = ratatui::init();
         let quit_style = Style::default()
@@ -283,14 +286,14 @@ impl YTRSAction {
                     let area = f.area();
 
                     if !media_ready {
-                        let popup_area = Rect::new(
+                        let popup_area = ratatui::layout::Rect::new(
                             area.x + (area.width as u16 / 4),
                             area.y + area.height as u16 / 2 - 4,
                             area.width as u16 / 2,
                             8,
                         );
                         let block = Block::default()
-                            .title("Starting MPV...")
+                            .title("[Starting MPV]")
                             .title_alignment(Alignment::Center)
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Cyan))
@@ -303,105 +306,203 @@ impl YTRSAction {
                             horizontal: 2,
                         });
 
-                        let loading_line =
-                            Rect::new(inner_area.x, inner_area.y + 2, inner_area.width, 1);
+                        let loading_line = ratatui::layout::Rect::new(
+                            inner_area.x,
+                            inner_area.y + 2,
+                            inner_area.width,
+                            1,
+                        );
                         let loading_text =
                             Paragraph::new(format!("{} Loading...", LOADING_FRAMES[loading_frame]))
                                 .style(status_style.add_modifier(Modifier::BOLD))
                                 .alignment(Alignment::Center);
                         f.render_widget(loading_text, loading_line);
-
-                        let status_line =
-                            Rect::new(inner_area.x, inner_area.y + 3, inner_area.width, 1);
-                        let status_text = Paragraph::new(ipc_status.clone())
-                            .style(Style::default().fg(Color::Rgb(150, 150, 150)))
-                            .alignment(Alignment::Center);
-                        f.render_widget(status_text, status_line);
                     } else {
-                        // Draw the thumbnail on top
-                        if let Some(thumbnail) = &thumbnail {
-                            let layout = Layout::vertical(Constraint::from_percentages([75, 25]))
-                                .split(area);
+                        // Draw the thumbnail on top, popup below
+                        if let Some(thumbnail) = thumbnail {
+                            let layout = Layout::vertical(Constraint::from_percentages([70, 30]))
+                                .split(f.area());
+                            let top = layout[0];
+                            let bottom = layout[1];
+
+                            let top_layout =
+                                Layout::horizontal(Constraint::from_percentages([10, 80, 10]))
+                                    .split(top);
+
+                            let popup_area = ratatui::layout::Rect::new(
+                                bottom.x + (bottom.width as u16 / 4),
+                                bottom.y + 1,
+                                bottom.width as u16 / 2,
+                                bottom.height as u16 - 2,
+                            );
+                            let image_area = Rect {
+                                x: popup_area.x + (popup_area.x / 5),
+                                y: 0,
+                                width: popup_area.width,
+                                height: top_layout[1].height,
+                            };
+                            if let Ok(picker) = picker::Picker::from_query_stdio() {
+                                if let Ok(protocol) = picker.new_protocol(
+                                    thumbnail.clone(),
+                                    image_area,
+                                    ratatui_image::Resize::Scale(None),
+                                ) {
+                                    f.render_widget(Image::new(&protocol), image_area);
+                                }
+                            }
+                            let block = Block::default()
+                                .title("Now Playing")
+                                .title_alignment(Alignment::Center)
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(Color::Cyan))
+                                .border_type(BorderType::Rounded)
+                                .style(Style::default().bg(Color::Rgb(30, 30, 45)));
+                            f.render_widget(block, popup_area);
+
+                            let inner_area = popup_area.inner(ratatui::layout::Margin {
+                                vertical: 1,
+                                horizontal: 2,
+                            });
+
+                            let title_area =
+                                Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
+                            let truncated_title = if title.len() > inner_area.width as usize {
+                                format!("{}...", &title[..inner_area.width as usize - 3])
+                            } else {
+                                title.clone()
+                            };
+                            let title_text = Paragraph::new(truncated_title)
+                                .style(status_style.add_modifier(Modifier::BOLD))
+                                .alignment(Alignment::Center);
+                            f.render_widget(title_text, title_area);
+
+                            // Format times as MM:SS
+                            let current_minutes = (playback_time as u64) / 60;
+                            let current_seconds = (playback_time as u64) % 60;
+                            let total_minutes = (duration as u64) / 60;
+                            let total_seconds = (duration as u64) % 60;
+                            let time_str = format!(
+                                "{:02}:{:02} / {:02}:{:02}",
+                                current_minutes, current_seconds, total_minutes, total_seconds
+                            );
+
+                            // Display time
+                            let time_area =
+                                Rect::new(inner_area.x, inner_area.y + 1, inner_area.width, 1);
+                            let time_text = Paragraph::new(time_str)
+                                .style(Style::default().fg(Color::LightCyan))
+                                .alignment(Alignment::Center);
+                            f.render_widget(time_text, time_area);
+
+                            // Draw progress gauge
+                            let gauge_area =
+                                Rect::new(inner_area.x, inner_area.y + 2, inner_area.width, 1);
+                            let progress = if duration > 0.0 {
+                                (playback_time / duration).min(1.0).max(0.0)
+                            } else {
+                                0.0
+                            };
+                            let gauge_width = inner_area.width.saturating_sub(2);
+                            let filled_width = (gauge_width as f64 * progress) as u16;
+                            let _empty_width = gauge_width.saturating_sub(filled_width);
+
+                            let gauge = ratatui::widgets::Gauge::default()
+                                .ratio(progress as f64)
+                                .gauge_style(Style::default().fg(Color::Yellow))
+                                .style(Style::default().fg(Color::DarkGray))
+                                .label("");
+                            f.render_widget(gauge, gauge_area);
+
+                            let quit_area =
+                                Rect::new(inner_area.x, inner_area.y + 5, inner_area.width, 1);
+                            let quit_text = Paragraph::new(ratatui::text::Text::from(
+                                ratatui::text::Line::from(vec![
+                                    Span::styled("Press ", quit_style),
+                                    Span::styled(" [ q ] ", key_style),
+                                    Span::styled("to stop", quit_style),
+                                ]),
+                            ))
+                            .alignment(Alignment::Center);
+                            f.render_widget(quit_text, quit_area);
+                        } else {
+                            let popup_area = ratatui::layout::Rect::new(
+                                area.x + (area.width as u16 / 4),
+                                area.y + area.height as u16 / 2 - 4,
+                                area.width as u16 / 2,
+                                8,
+                            );
+                            let block = Block::default()
+                                .title("Now Playing")
+                                .title_alignment(Alignment::Center)
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(Color::Cyan))
+                                .border_type(BorderType::Rounded)
+                                .style(Style::default().bg(Color::Rgb(30, 30, 45)));
+                            f.render_widget(block, popup_area);
+
+                            let inner_area = popup_area.inner(ratatui::layout::Margin {
+                                vertical: 1,
+                                horizontal: 2,
+                            });
+
+                            let title_area =
+                                Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
+                            let truncated_title = if title.len() > inner_area.width as usize {
+                                format!("{}...", &title[..inner_area.width as usize - 3])
+                            } else {
+                                title.clone()
+                            };
+                            let title_text = Paragraph::new(truncated_title)
+                                .style(status_style.add_modifier(Modifier::BOLD))
+                                .alignment(Alignment::Center);
+                            f.render_widget(title_text, title_area);
+
+                            let current_minutes = (playback_time as u64) / 60;
+                            let current_seconds = (playback_time as u64) % 60;
+                            let total_minutes = (duration as u64) / 60;
+                            let total_seconds = (duration as u64) % 60;
+                            let time_str = format!(
+                                "{:02}:{:02} / {:02}:{:02}",
+                                current_minutes, current_seconds, total_minutes, total_seconds
+                            );
+
+                            let time_area =
+                                Rect::new(inner_area.x, inner_area.y + 1, inner_area.width, 1);
+                            let time_text = Paragraph::new(time_str)
+                                .style(Style::default().fg(Color::LightCyan))
+                                .alignment(Alignment::Center);
+                            f.render_widget(time_text, time_area);
+
+                            let gauge_area =
+                                Rect::new(inner_area.x, inner_area.y + 2, inner_area.width, 1);
+                            let progress = if duration > 0.0 {
+                                (playback_time / duration).min(1.0).max(0.0)
+                            } else {
+                                0.0
+                            };
+                            let gauge_width = inner_area.width.saturating_sub(2);
+                            let filled_width = (gauge_width as f64 * progress) as u16;
+                            let _empty_width = gauge_width.saturating_sub(filled_width);
+
+                            let gauge = ratatui::widgets::Gauge::default()
+                                .ratio(progress as f64)
+                                .gauge_style(Style::default().fg(Color::Yellow))
+                                .style(Style::default().fg(Color::DarkGray))
+                                .label("");
+                            f.render_widget(gauge, gauge_area);
+
+                            let quit_area =
+                                Rect::new(inner_area.x, inner_area.y + 5, inner_area.width, 1);
+                            let quit_text = Paragraph::new(ratatui::text::Text::from(
+                                ratatui::text::Line::from(vec![
+                                    Span::styled("Press ", quit_style),
+                                    Span::styled(" [ q ] ", key_style),
+                                    Span::styled("to stop", quit_style),
+                                ]),
+                            ))
+                            .alignment(Alignment::Center);
+                            f.render_widget(quit_text, quit_area);
                         }
-                        let popup_area = Rect::new(
-                            area.x + (area.width as u16 / 4),
-                            area.y + area.height as u16 - 7,
-                            area.width as u16 / 2,
-                            8,
-                        );
-                        let block = Block::default()
-                            .title("Now Playing")
-                            .title_alignment(Alignment::Center)
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Cyan))
-                            .border_type(BorderType::Rounded)
-                            .style(Style::default().bg(Color::Rgb(30, 30, 45)));
-                        f.render_widget(block, popup_area);
-
-                        let inner_area = popup_area.inner(ratatui::layout::Margin {
-                            vertical: 1,
-                            horizontal: 2,
-                        });
-
-                        let title_area = Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
-                        let truncated_title = if title.len() > inner_area.width as usize {
-                            format!("{}...", &title[..inner_area.width as usize - 3])
-                        } else {
-                            title.clone()
-                        };
-                        let title_text = Paragraph::new(truncated_title)
-                            .style(status_style.add_modifier(Modifier::BOLD))
-                            .alignment(Alignment::Center);
-                        f.render_widget(title_text, title_area);
-
-                        // Format times as MM:SS
-                        let current_minutes = (playback_time as u64) / 60;
-                        let current_seconds = (playback_time as u64) % 60;
-                        let total_minutes = (duration as u64) / 60;
-                        let total_seconds = (duration as u64) % 60;
-                        let time_str = format!(
-                            "{:02}:{:02} / {:02}:{:02}",
-                            current_minutes, current_seconds, total_minutes, total_seconds
-                        );
-
-                        // Display time
-                        let time_area =
-                            Rect::new(inner_area.x, inner_area.y + 1, inner_area.width, 1);
-                        let time_text = Paragraph::new(time_str)
-                            .style(Style::default().fg(Color::LightCyan))
-                            .alignment(Alignment::Center);
-                        f.render_widget(time_text, time_area);
-
-                        // Draw progress gauge
-                        let gauge_area =
-                            Rect::new(inner_area.x, inner_area.y + 2, inner_area.width, 1);
-                        let progress = if duration > 0.0 {
-                            (playback_time / duration).min(1.0).max(0.0)
-                        } else {
-                            0.0
-                        };
-                        let gauge_width = inner_area.width.saturating_sub(2);
-                        let filled_width = (gauge_width as f64 * progress) as u16;
-                        let _empty_width = gauge_width.saturating_sub(filled_width);
-
-                        let gauge = ratatui::widgets::Gauge::default()
-                            .ratio(progress as f64)
-                            .gauge_style(Style::default().fg(Color::Yellow))
-                            .style(Style::default().fg(Color::DarkGray))
-                            .label("");
-                        f.render_widget(gauge, gauge_area);
-
-                        let quit_area =
-                            Rect::new(inner_area.x, inner_area.y + 5, inner_area.width, 1);
-                        let quit_text = Paragraph::new(ratatui::text::Text::from(
-                            ratatui::text::Line::from(vec![
-                                Span::styled("Press ", quit_style),
-                                Span::styled(" [ q ] ", key_style),
-                                Span::styled("to stop", quit_style),
-                            ]),
-                        ))
-                        .alignment(Alignment::Center);
-                        f.render_widget(quit_text, quit_area);
                     }
                 })
                 .expect("Terminal draw crashed");
@@ -485,7 +586,7 @@ impl YTRSAction {
             let mut mpv = MpvPlayer::new(true, &url)
                 .await
                 .context("Failed to start MPV")?;
-            self.watch_playback(&mut mpv, Some(thumbnail)).await?;
+            self.watch_playback(&mut mpv, &mut Some(thumbnail)).await?;
         }
     }
 
@@ -615,10 +716,7 @@ impl YTRSAction {
         Ok(())
     }
 
-    /// Find ffmpeg binary path dynamically
-    /// Searches: libs/ffmpeg.exe, libs/ffmpeg, libs/*/bin/ffmpeg.exe, libs/*/*/bin/ffmpeg.exe
     fn find_ffmpeg_path(libraries_dir: &PathBuf) -> Result<PathBuf> {
-        // Check common locations
         if libraries_dir.join("ffmpeg.exe").exists() {
             return Ok(libraries_dir.join("ffmpeg.exe"));
         }
@@ -632,11 +730,7 @@ impl YTRSAction {
         {
             return Ok(libraries_dir.join("ffmpeg-release").join("ffmpeg.exe"));
         }
-
-        // Search recursively for ffmpeg.exe
         let mut ffmpeg_path = None;
-
-        // First level: libs/*/bin/ffmpeg.exe
         if let Ok(entries) = std::fs::read_dir(libraries_dir) {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
@@ -646,7 +740,6 @@ impl YTRSAction {
                         break;
                     }
 
-                    // Second level: libs/*/*/bin/ffmpeg.exe (for versioned directories)
                     if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
                         for sub_entry in sub_entries.flatten() {
                             if sub_entry.path().is_dir() {
@@ -671,7 +764,6 @@ impl YTRSAction {
         }
     }
 
-    /// Convert m4a to mp3 using ffmpeg with VBR quality (q:a 4)
     async fn convert_m4a_to_mp3(
         input_path: &PathBuf,
         output_path: &PathBuf,
@@ -699,7 +791,6 @@ impl YTRSAction {
             .context("Failed to execute ffmpeg for conversion")?;
 
         if output.status.success() {
-            // Remove the original m4a file
             std::fs::remove_file(input_path)?;
             Ok(())
         } else {
@@ -714,7 +805,6 @@ impl YTRSAction {
         output_dir: &PathBuf,
         libraries_dir: &PathBuf,
     ) -> Result<(), anyhow::Error> {
-        // Search for video/music (using YouTube Music for now)
         if yt_music {
             let (yt_music_query, _) = YtMusicQuery::new_music_search(None).await?;
             *self = Self::Ytdlp {
@@ -751,7 +841,6 @@ impl YTRSAction {
         }
         let url = format!("https://www.youtube.com/watch?v={}", self.get_id().unwrap());
 
-        // Find yt-dlp binary (try both .exe and no extension)
         let ytdlp = if libraries_dir.join("yt-dlp.exe").exists() {
             libraries_dir.join("yt-dlp.exe")
         } else if libraries_dir.join("yt-dlp").exists() {
@@ -760,7 +849,6 @@ impl YTRSAction {
             bail!("yt-dlp not found in libs directory");
         };
 
-        // Find ffmpeg binary using dynamic search
         let ffmpeg = Self::find_ffmpeg_path(libraries_dir)?;
 
         let libraries = Libraries::new(ytdlp, ffmpeg);
@@ -811,10 +899,8 @@ impl YTRSAction {
 
                     println!("Downloading audio as {}...", extension);
 
-                    // Find ffmpeg path for potential conversion
                     let ffmpeg_convert_path = Self::find_ffmpeg_path(libraries_dir)?;
 
-                    // Download as m4a first (yt-dlp always outputs m4a for audio)
                     let m4a_name = format!("{}.m4a", self.get_name().unwrap());
 
                     match fetcher
@@ -822,7 +908,6 @@ impl YTRSAction {
                         .await
                     {
                         Ok(path) => {
-                            // If user wanted mp3, convert from m4a
                             if extension == "mp3" {
                                 let mp3_path = path.with_extension("mp3");
                                 match Self::convert_m4a_to_mp3(
@@ -839,7 +924,6 @@ impl YTRSAction {
                                         println!("📁 Location: {}", mp3_path.to_string_lossy());
                                     }
                                     Err(e) => {
-                                        // Keep the m4a if conversion fails
                                         eprintln!(
                                             "Warning: MP3 conversion failed: {}. Keeping m4a file.",
                                             e
@@ -849,7 +933,6 @@ impl YTRSAction {
                                     }
                                 }
                             } else {
-                                // Rename to requested extension if different from m4a
                                 let final_path = path;
                                 println!("Audio downloaded successfully!");
                                 println!("📁 Location: {}", final_path.to_string_lossy());
@@ -961,11 +1044,10 @@ impl YtMusicQuery {
             .items
             .items
             .into_iter()
-            .map(|x| x.name.to_string())
+            .map(|track| TrackInfo::from(&track).to_string())
             .collect();
         found_videos_str.push("Exit".to_owned());
         let selected_vid_str = Select::new("Select Music", found_videos_str)
-            .with_page_size(12)
             .prompt()
             .context("Failed to select music")?;
         if selected_vid_str == "Exit" {
@@ -980,12 +1062,71 @@ impl YtMusicQuery {
             .items
             .items
             .into_iter()
-            .find(|track| track.name() == selected_vid_str)
+            .find(|track| TrackInfo::from(track).to_string() == selected_vid_str)
         {
             Ok((Self { video: vid }, search_term))
         } else {
             bail!("Selected music not found. Please try again.");
         }
+    }
+}
+
+pub struct TrackInfo {
+    artists: String,
+    track_name: String,
+    id: String,
+    duration: Option<u32>,
+    view_count: Option<u64>,
+}
+
+impl From<&TrackItem> for TrackInfo {
+    fn from(value: &TrackItem) -> Self {
+        Self {
+            artists: value.artists.iter().map(|a| a.name.clone()).collect(),
+            track_name: value.name.clone(),
+            id: value.id.clone(),
+            duration: value.duration.clone(),
+            view_count: value.view_count.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for TrackInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Track name: '{}'{}{}\nArtist(s): [{}]",
+            self.track_name.clone().green(),
+            match self.duration {
+                Some(d) => {
+                    let hours = d / 3600;
+                    let minutes = (d % 3600) / 60;
+                    let secs = d % 60;
+                    format!(
+                        " [{}{}{}]",
+                        if hours > 0 {
+                            format!("{hours:02}:").green()
+                        } else {
+                            "".to_owned().green()
+                        },
+                        if minutes > 0 {
+                            format!("{minutes:02}:").green()
+                        } else {
+                            "".to_string().green()
+                        },
+                        format!("{secs:02}").green()
+                    )
+                }
+                None => {
+                    "".to_string()
+                }
+            },
+            match self.view_count {
+                Some(views) => format!(" Views: {}", views).dark_blue(),
+                None => "".to_owned().dark_blue(),
+            },
+            self.artists.clone().blue()
+        )
     }
 }
 
