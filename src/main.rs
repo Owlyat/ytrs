@@ -193,7 +193,6 @@ impl YTRSAction {
                 .prompt()
                 .context("Failed to read query input")?;
 
-            println!("Searching for: {}", query);
             match YTQuery::from(query.as_str()).await {
                 Ok(yt) => {
                     *self = Self::Watch { yt_query: yt };
@@ -259,6 +258,30 @@ impl YTRSAction {
                 return Ok(());
             } else {
                 let title = self.get_name().unwrap_or_default();
+                let creator = match self {
+                    YTRSAction::None => None,
+                    YTRSAction::Ytdlp { yt_query } => match yt_query {
+                        Query::YtQuery(ytquery) => ytquery.video.channel.clone().map(|v| v.name),
+                        Query::YtMusicQuery(yt_music_query) => yt_music_query
+                            .video
+                            .artists
+                            .iter()
+                            .map(|a| Some(a.name.clone()))
+                            .collect::<Option<String>>(),
+                    },
+                    YTRSAction::Watch { yt_query } => {
+                        yt_query.video.channel.clone().map(|c| c.name)
+                    }
+                    YTRSAction::Listen {
+                        yt_query,
+                        search_term,
+                    } => yt_query
+                        .video
+                        .artists
+                        .iter()
+                        .map(|a| Some(a.name.clone()))
+                        .collect::<Option<String>>(),
+                };
 
                 // Update playback time from observer
                 if let Ok(has_changed) = time_rx.has_changed() {
@@ -336,8 +359,8 @@ impl YTRSAction {
                                 bottom.height as u16 - 2,
                             );
                             let image_area = Rect {
-                                x: popup_area.x + (popup_area.x / 5),
-                                y: 0,
+                                x: popup_area.x + popup_area.x % 5,
+                                y: top_layout[1].y,
                                 width: popup_area.width,
                                 height: top_layout[1].height,
                             };
@@ -366,14 +389,17 @@ impl YTRSAction {
 
                             let title_area =
                                 Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
-                            let truncated_title = if title.len() > inner_area.width as usize {
-                                format!("{}...", &title[..inner_area.width as usize - 3])
-                            } else {
-                                title.clone()
-                            };
-                            let title_text = Paragraph::new(truncated_title)
-                                .style(status_style.add_modifier(Modifier::BOLD))
-                                .alignment(Alignment::Center);
+                            let title_text = Paragraph::new(format!(
+                                "{}'{}'",
+                                if let Some(creator) = creator {
+                                    format!("[{creator}] - ")
+                                } else {
+                                    "".to_string()
+                                },
+                                title
+                            ))
+                            .style(status_style.add_modifier(Modifier::BOLD))
+                            .alignment(Alignment::Center);
                             f.render_widget(title_text, title_area);
 
                             // Format times as MM:SS
@@ -447,14 +473,17 @@ impl YTRSAction {
 
                             let title_area =
                                 Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
-                            let truncated_title = if title.len() > inner_area.width as usize {
-                                format!("{}...", &title[..inner_area.width as usize - 3])
-                            } else {
-                                title.clone()
-                            };
-                            let title_text = Paragraph::new(truncated_title)
-                                .style(status_style.add_modifier(Modifier::BOLD))
-                                .alignment(Alignment::Center);
+                            let title_text = Paragraph::new(format!(
+                                "{}'{}'",
+                                if let Some(creator) = creator {
+                                    format!("[{}] - ", creator)
+                                } else {
+                                    "".to_string()
+                                },
+                                title
+                            ))
+                            .style(status_style.add_modifier(Modifier::BOLD))
+                            .alignment(Alignment::Center);
                             f.render_widget(title_text, title_area);
 
                             let current_minutes = (playback_time as u64) / 60;
@@ -1071,6 +1100,44 @@ impl YtMusicQuery {
     }
 }
 
+pub struct VideoInfo {
+    channel: Option<String>,
+    name: String,
+    view_count: Option<u64>,
+    duration: Option<u32>,
+}
+
+impl From<&VideoItem> for VideoInfo {
+    fn from(value: &VideoItem) -> Self {
+        Self {
+            channel: value.channel.clone().map(|i| i.name),
+            name: value.name.clone(),
+            view_count: value.view_count.clone(),
+            duration: value.duration.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for VideoInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Video name: [{}]{}{}",
+            format!("{}", self.name).green(),
+            if let Some(d) = self.duration {
+                format!(" {}", format_time(d))
+            } else {
+                "".to_string()
+            },
+            if let Some(chan) = &self.channel {
+                format!("\n\tBy: {}", chan).blue()
+            } else {
+                "".to_string().blue()
+            }
+        )
+    }
+}
+
 pub struct TrackInfo {
     artists: String,
     track_name: String,
@@ -1090,32 +1157,34 @@ impl From<&TrackItem> for TrackInfo {
         }
     }
 }
-
+fn format_time(d: u32) -> impl std::fmt::Display {
+    let hours = d / 3600;
+    let minutes = (d % 3600) / 60;
+    let secs = d % 60;
+    format!(
+        "[{}{}{}]",
+        if hours > 0 {
+            format!("{hours:02}:").green()
+        } else {
+            "".to_owned().green()
+        },
+        if minutes > 0 {
+            format!("{minutes:02}:").green()
+        } else {
+            "".to_string().green()
+        },
+        format!("{secs:02}").green()
+    )
+}
 impl std::fmt::Display for TrackInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Track name: '{}'{}{}\nArtist(s): [{}]",
+            "Track name: '{}'{}{}\n\tArtist(s): [{}]",
             self.track_name.clone().green(),
             match self.duration {
                 Some(d) => {
-                    let hours = d / 3600;
-                    let minutes = (d % 3600) / 60;
-                    let secs = d % 60;
-                    format!(
-                        " [{}{}{}]",
-                        if hours > 0 {
-                            format!("{hours:02}:").green()
-                        } else {
-                            "".to_owned().green()
-                        },
-                        if minutes > 0 {
-                            format!("{minutes:02}:").green()
-                        } else {
-                            "".to_string().green()
-                        },
-                        format!("{secs:02}").green()
-                    )
+                    format!(" {}", format_time(d))
                 }
                 None => {
                     "".to_string()
@@ -1148,16 +1217,15 @@ impl YTQuery {
             .items
             .items
             .iter()
-            .map(|v: &VideoItem| format!("-> {}", v.name))
+            .map(|v: &VideoItem| VideoInfo::from(v).to_string())
             .collect();
         videos.push("Exit".to_owned());
 
-        let video_name = Select::new("Select video to watch", videos)
-            .with_page_size(12)
+        let video_entry = Select::new("Select video to watch", videos)
             .with_help_message("Type to filter | Arrow keys to navigate | Enter to select")
             .prompt()
             .context("Failed to select video")?;
-        if video_name == "Exit" {
+        if video_entry == "Exit" {
             let confirm = Confirm::new("Exit application?")
                 .with_default(true)
                 .prompt()?;
@@ -1169,7 +1237,7 @@ impl YTQuery {
             .items
             .items
             .into_iter()
-            .find(|v| video_name.contains(&v.name));
+            .find(|v| VideoInfo::from(v).to_string() == video_entry);
         if let Some(vid) = selected_vid {
             Ok(Self { video: vid })
         } else {
