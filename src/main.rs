@@ -8,7 +8,14 @@ use strum::IntoEnumIterator;
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut api = None;
+    let mut app: Option<YoutubeRs> = None;
     loop {
+        if let Some(current_app) = &mut app
+            && current_app.action.to_string().as_str() == "Player"
+        {
+            current_app.process().await?;
+            continue;
+        }
         let mut res =
             inquire::Select::new("Select Action", AppAction::iter().collect()).prompt()?;
         match res {
@@ -46,13 +53,16 @@ async fn main() -> Result<()> {
         if api.is_none() {
             api = Some(inquire::Select::new("Select API", YoutubeAPI::iter().collect()).prompt()?);
         }
-        let mut app = YoutubeRs {
+
+        app = Some(YoutubeRs {
             api: api.clone().unwrap_or_default(),
             action: res,
             mpv_installed: YoutubeRs::check_mpv().unwrap_or_default(),
             last_search: None,
-        };
-        app.process().await?;
+        });
+        if let Some(app) = &mut app {
+            app.process().await?;
+        }
     }
     Ok(())
 }

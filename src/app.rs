@@ -143,11 +143,13 @@ impl YoutubeRs {
                 }
                 let (video_id, video_name) = match self.api {
                     YoutubeAPI::Music => {
-                        let (track, _) = Self::query_ytmusic(self.last_search.clone()).await?;
+                        let (track, search) = Self::query_ytmusic(self.last_search.clone()).await?;
+                        self.last_search = Some(search);
                         (track.id.clone(), track.name.clone())
                     }
                     YoutubeAPI::Video => {
-                        let (video, _) = Self::query_ytvideo(self.last_search.clone()).await?;
+                        let (video, search) = Self::query_ytvideo(self.last_search.clone()).await?;
+                        self.last_search = Some(search);
                         (video.id.clone(), video.name.clone())
                     }
                 };
@@ -167,11 +169,13 @@ impl YoutubeRs {
                 }
                 let video_id = match self.api {
                     YoutubeAPI::Music => {
-                        let (track, _) = Self::query_ytmusic(self.last_search.clone()).await?;
+                        let (track, search) = Self::query_ytmusic(self.last_search.clone()).await?;
+                        self.last_search = Some(search);
                         track.id.clone()
                     }
                     YoutubeAPI::Video => {
-                        let (video, _) = Self::query_ytvideo(self.last_search.clone()).await?;
+                        let (video, search) = Self::query_ytvideo(self.last_search.clone()).await?;
+                        self.last_search = Some(search);
                         video.id.clone()
                     }
                 };
@@ -182,12 +186,16 @@ impl YoutubeRs {
                     self.mpv_installed = Self::check_mpv()?;
                 }
                 let response = match self.api {
-                    YoutubeAPI::Music => YoutubeResponse::Track(
-                        Self::query_ytmusic(self.last_search.clone()).await?.0,
-                    ),
-                    YoutubeAPI::Video => YoutubeResponse::Video(
-                        Self::query_ytvideo(self.last_search.clone()).await?.0,
-                    ),
+                    YoutubeAPI::Music => {
+                        let res = Self::query_ytmusic(self.last_search.clone()).await?;
+                        self.last_search = Some(res.1);
+                        YoutubeResponse::Track(res.0)
+                    }
+                    YoutubeAPI::Video => {
+                        let res = Self::query_ytvideo(self.last_search.clone()).await?;
+                        self.last_search = Some(res.1);
+                        YoutubeResponse::Video(res.0)
+                    }
                 };
                 match format {
                     Format::Audio { .. } => {
