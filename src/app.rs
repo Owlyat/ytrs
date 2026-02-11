@@ -162,6 +162,9 @@ impl YoutubeRs {
                 }
             }
             AppAction::Transcript => {
+                if !self.check_ytdlp()? {
+                    Self::install_lib().await?;
+                }
                 let video_id = match self.api {
                     YoutubeAPI::Music => {
                         let (track, _) = Self::query_ytmusic(self.last_search.clone()).await?;
@@ -488,11 +491,19 @@ impl YoutubeRs {
 
         let languages = fetcher.list_subtitle_languages(&video);
         if languages.is_empty() {
+            println!("Finding Generated Captions");
             let cap: Vec<(String, &Vec<yt_dlp::model::caption::AutomaticCaption>)> = video
                 .automatic_captions
                 .iter()
                 .map(|v| (v.0.clone(), v.1))
                 .collect();
+            if cap.is_empty() {
+                println!("No Generated Caption found");
+                if !video.description.is_empty() {
+                    println!("{}: \n{}", "Video Description".green(), video.description);
+                }
+                return Ok(());
+            }
             let lang = inquire::Select::new(
                 "Generated Lang",
                 cap.iter().map(|(lang, _)| lang.clone()).collect(),
@@ -553,6 +564,7 @@ impl YoutubeRs {
             }
             return Ok(());
         }
+        println!("Finding Subtitles");
 
         let selected_lang = inquire::Select::new("Lang", languages).prompt()?;
         // Download English subtitles
