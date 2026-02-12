@@ -2176,9 +2176,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.27"
+version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
+checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "loop9"
@@ -2346,18 +2346,6 @@ name = "mp4ameta"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "453e991b2efe96c288cbc2d03a19e353504294559ecb6c03067fff5bd824616d"
-
-[[package]]
-name = "mpv-ipc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "log",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
 
 [[package]]
 name = "native-tls"
@@ -4725,9 +4713,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.14"
+version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b9590b93e6fcc1739458317cccd391ad3955e2bde8913edf6f95f9e65a8f034"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
@@ -4897,6 +4885,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unix-timestamp"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8b9fde8aea40edca8646954bbf8c3ac125345fe0ba8549cfb382c153e67bbe3"
 
 [[package]]
 name = "untrusted"
@@ -5897,19 +5891,21 @@ dependencies = [
  "chrono",
  "image",
  "inquire",
- "mpv-ipc",
  "ollama-rs",
  "ratatui",
  "ratatui-image",
  "ratatui-macros",
  "reqwest 0.13.1",
  "rustypipe",
+ "serde",
  "serde_json",
  "strum",
  "terminal-clipboard",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-util",
+ "unix-timestamp",
  "yt-dlp",
 ]
 

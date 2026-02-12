@@ -2,11 +2,26 @@
 name = "ytrs"
 version = "0.1.0"
 edition = "2024"
+include = [
+  "src/**/*",
+  "Cargo.toml",
+  "README.md",
+  "LICENSE",
+]
+license = "GPL-3.0"
+homepage = "https://github.com/Owlyat/ytrs"
+description = "Youtube TUI to download/watch/listen videos/music/transcript using MPV/YT-DLP/ffmpeg/Rustypipe"
+repository = "https://github.com/Owlyat/ytrs"
+keywords = [
+  "tui",
+  "youtube",
+  "terminal",
+]
 
 [dependencies]
 anyhow = "1.0.89"
 inquire = "0.7.5"
-mpv-ipc = { path = "mpv-ipc" }
+# mpv-ipc = { path = "mpv-ipc" }
 ratatui = "0.30.0"
 rustypipe = "0.11.3"
 serde_json = "1.0"
@@ -22,3 +37,6 @@ terminal-clipboard = "0.4"
 thiserror = "2.0.18"
 ollama-rs = { version = "0.3.3", features = ["stream"] }
 tokio-stream = "0.1.18"
+serde = "1.0.228"
+tokio-util = "0.7.18"
+unix-timestamp = "0.1.1"

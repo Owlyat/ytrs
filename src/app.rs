@@ -1,8 +1,8 @@
+use crate::mpv::{MpvIpc, MpvSpawnOptions};
 use anyhow::{Context, Result, bail};
 use chrono::{Timelike, Utc};
 use image::DynamicImage;
 use inquire::{Confirm, Select, Text as InquireText, validator::Validation};
-use mpv_ipc::{MpvIpc, MpvSpawnOptions};
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ratatui::layout::Flex;

@@ -1,4 +1,5 @@
 mod app;
+mod mpv;
 mod utility;
 
 use anyhow::Result;
