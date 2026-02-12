@@ -30,10 +30,12 @@ pub enum AppActionCli {
     },
     /// Play from the provided url or file
     Player {
-        #[clap(short, long, conflicts_with = "url")]
-        file: Option<PathBuf>,
         #[clap(short, long)]
+        file: Option<PathBuf>,
+        #[clap(short, long, conflicts_with = "file")]
         url: Option<String>,
+        #[clap(short, long, conflicts_with = "file")]
+        api: Option<PlayerAPI>,
     },
     /// Download the transcript using the query
     Transcript {
@@ -44,4 +46,10 @@ pub enum AppActionCli {
         #[clap(short, long, help = "Requires Ollama")]
         summarize: Option<bool>,
     },
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum PlayerAPI {
+    Video,
+    Music,
 }

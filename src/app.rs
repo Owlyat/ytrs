@@ -5,7 +5,11 @@ use chrono::{Timelike, Utc};
 use image::DynamicImage;
 use inquire::{Confirm, Select, Text as InquireText, validator::Validation};
 use inquire_derive::Selectable;
+use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
+use lofty::picture::Picture;
+use lofty::probe::Probe;
+use lofty::tag::{Accessor, Tag, TagExt};
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ratatui::layout::Flex;
@@ -209,11 +213,36 @@ impl YoutubeRsBuilder {
     }
     pub fn player(&mut self) -> &mut Self {
         self.action = Some(AppAction::Player {
-            format: Format::default(),
+            format: Default::default(),
         });
         self
     }
+    pub fn prompt_player(&mut self) -> &mut Self {
+        self.action = Some(AppAction::Player {
+            format: FormatInquire::select("Format").prompt().unwrap().into(),
+        });
+        self.api = Some(YoutubeAPI::select("Select API").prompt().unwrap());
+        self
+    }
     pub fn file(&mut self, p: PathBuf) -> &mut Self {
+        if let Some(ext) = p.extension() {
+            if let Some(i) = AudioFormat::iter()
+                .find(|af| af.to_string().to_lowercase() == ext.to_string_lossy().to_lowercase())
+                .iter()
+                .next()
+            {
+                if let Some(AppAction::Player { format }) = &mut self.action {
+                    *format = Format::Audio { format: i.clone() };
+                }
+            } else if let Some(i) = VideoFormat::iter()
+                .filter(|vf| vf.to_string().to_lowercase() == ext.to_string_lossy().to_lowercase())
+                .next()
+            {
+                if let Some(AppAction::Player { format }) = &mut self.action {
+                    *format = Format::Video { format: i.clone() }
+                }
+            }
+        }
         self.last_search = Some(p.to_string_lossy().to_string());
         self
     }
@@ -276,7 +305,7 @@ impl YoutubeRs {
     pub async fn process(&mut self) -> Result<()> {
         match self.action.clone() {
             AppAction::Download { format } => {
-                if !self.check_libraries(&self.args.clone()) {
+                if !self.libraries_exist(&self.args.clone()) {
                     Self::install_lib(&self.args).await?;
                 }
                 let (video_id, video_name) = match self.api {
@@ -305,7 +334,7 @@ impl YoutubeRs {
                 }
             }
             AppAction::Transcript => {
-                if !self.check_libraries(&self.args.clone()) {
+                if !self.libraries_exist(&self.args.clone()) {
                     Self::install_lib(&self.args).await?;
                 }
                 let video_id = match self.api {
@@ -385,6 +414,65 @@ impl YoutubeRs {
         opt_thumbnail: &mut Option<DynamicImage>,
         audio_only: bool,
     ) {
+        let mut img = if let Some(dyn_thumbnail) = &opt_thumbnail
+            && let Ok(picker) = picker::Picker::from_query_stdio()
+        {
+            let protocol = picker.new_resize_protocol(dyn_thumbnail.clone());
+            Some(protocol)
+        } else {
+            None
+        };
+        let mut audio_file_error = None;
+        let mut file: Option<(TaggedFile, String)> = {
+            if let Some(s) = &self.last_search {
+                let f = PathBuf::from(s);
+                if f.exists() && f.is_file() {
+                    use lofty::probe::Probe;
+                    if let Ok(file) = Probe::open(&f) {
+                        match file.guess_file_type() {
+                            Ok(file) => match file.read() {
+                                Ok(tagged_file) => {
+                                    if let Some(tag) = tagged_file.primary_tag() {
+                                        if let Some(pic) = tag.pictures().first() {
+                                            if let Ok(dyn_img) = image::load_from_memory(pic.data())
+                                            {
+                                                img = if let Ok(picker) =
+                                                    picker::Picker::from_query_stdio()
+                                                {
+                                                    let protocole =
+                                                        picker.new_resize_protocol(dyn_img.clone());
+                                                    Some(protocole)
+                                                } else {
+                                                    None
+                                                };
+                                            }
+                                        }
+                                    }
+                                    Some((tagged_file, f.to_string_lossy().to_string()))
+                                }
+                                Err(e) => {
+                                    audio_file_error = Some(format!("Could not read file {e}"));
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                audio_file_error = Some(format!("Could not guess file type: {e}"));
+                                None
+                            }
+                        }
+                    } else {
+                        audio_file_error = Some("Could not open file".to_string());
+                        None
+                    }
+                } else {
+                    audio_file_error = Some("File does not exist".to_string());
+                    None
+                }
+            } else {
+                audio_file_error = Some("No File provided".to_string());
+                None
+            }
+        };
         let opts = MpvSpawnOptions::default();
         let mut mpv = MpvIpc::spawn(&opts, audio_only)
             .await
@@ -395,13 +483,16 @@ impl YoutubeRs {
                 .await
                 .context("Failed to load media")
                 .expect("Could not send command to MPV");
+        } else if let Some(file) = &file {
+            mpv.send_command(json!(["loadfile", file.1]))
+                .await
+                .context("Failed to load media")
+                .expect("Could not send command to MPV");
         } else {
-            if let Some(file) = &self.last_search {
-                mpv.send_command(json!(["loadfile", file]))
-                    .await
-                    .context("Failed to load media")
-                    .expect("Could not send command to MPV");
-            }
+            panic!(
+                "Error : {}",
+                audio_file_error.unwrap_or("No file found".to_string())
+            );
         }
 
         let mut term = ratatui::init();
@@ -409,69 +500,26 @@ impl YoutubeRs {
         let mut playback_time = 0.0;
         let mut vid_started = false;
         let loader = ["/", "|", "\\", "-"];
-        let loader_idx = 0;
+        let mut loader_idx = 0;
         let mut pause_state = false;
         let mut open_popup = false;
         let mut videos_list: Vec<(String, YoutubeResponse)> = Vec::new();
         let mut selected_list_item = ListState::default();
         let mut popup_query = String::new();
-        let mut img = if let Some(dyn_thumbnail) = &opt_thumbnail
-            && let Ok(picker) = picker::Picker::from_query_stdio()
-        {
-            let protocol = picker.new_resize_protocol(dyn_thumbnail.clone());
-            Some(protocol)
-        } else {
-            None
-        };
-        let mut file: Option<(TaggedFile, String)> = {
-            if let Some(s) = &self.last_search {
-                let f = PathBuf::from(s);
-                if f.exists() && f.is_file() {
-                    use lofty::probe::Probe;
-                    if let Ok(file) = Probe::open(&f) {
-                        if let Ok(tagged_file) = file.read() {
-                            if let Some(tag) = tagged_file.primary_tag() {
-                                if let Some(pic) = tag.pictures().first() {
-                                    if let Ok(dyn_img) = image::load_from_memory(pic.data()) {
-                                        img = if let Ok(picker) = picker::Picker::from_query_stdio()
-                                        {
-                                            let protocole =
-                                                picker.new_resize_protocol(dyn_img.clone());
-                                            Some(protocole)
-                                        } else {
-                                            None
-                                        };
-                                    }
-                                }
-                            }
-                            Some((tagged_file, f.to_string_lossy().to_string()))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
 
         // TUI Main Loop
         loop {
             if !mpv.running().await {
                 break;
             }
-            if let Ok(has_changed) = time_rx.has_changed()
-                && has_changed
+            if time_rx
+                .has_changed()
+                .expect("Error while checking if MPV time changed")
             {
-                // Mpv found the video
                 playback_time = *time_rx.borrow();
-                if playback_time == 0.0 && !vid_started {
-                    vid_started = true;
-                }
+            }
+            if playback_time == 0.0 && !vid_started {
+                vid_started = true;
             }
 
             let _ = term.draw(|f| {
@@ -480,7 +528,7 @@ impl YoutubeRs {
                     playback_time,
                     vid_started,
                     loader,
-                    loader_idx,
+                    &mut loader_idx,
                     open_popup,
                     &videos_list,
                     &mut selected_list_item,
@@ -632,7 +680,7 @@ impl YoutubeRs {
         playback_time: f64,
         vid_started: bool,
         loader: [&str; 4],
-        mut loader_idx: usize,
+        loader_idx: &mut usize,
         open_popup: bool,
         videos_list: &Vec<(String, YoutubeResponse)>,
         selected_list_item: &mut ListState,
@@ -671,11 +719,12 @@ impl YoutubeRs {
                 self.render_yt_player(response, playback_time, f, info_layout, file);
             }
         } else {
+            // Vid not started
             if Utc::now().second().is_multiple_of(2) {
-                loader_idx += 1 % loader.len();
+                *loader_idx = loader_idx.saturating_add(1) % loader.len();
             }
             Block::bordered()
-                .title(format!("[Loading MPV {}]", loader[loader_idx]))
+                .title(format!("[Loading MPV {}]", loader[*loader_idx]))
                 .render(f.area(), f.buffer_mut());
         }
     }
@@ -751,33 +800,33 @@ impl YoutubeRs {
                 .block(Block::bordered().style(Style::default().yellow().on_blue()))
                 .ratio(playback_time / res.get_duration() as f64)
                 .render(gauge_layout, f.buffer_mut());
-        } else {
-            if let Some(file) = file {
-                // TODO Get time
-                Block::bordered()
-                    .style(Style::default().yellow().on_blue())
-                    .title_top(format!(
-                        "{} - {}:{}",
-                        file.1,
-                        format_time(playback_time as u32),
-                        format_time(file.0.properties().duration().as_secs() as u32),
-                    ))
-                    .title_alignment(HorizontalAlignment::Center)
-                    .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek]")
-                    .title_alignment(HorizontalAlignment::Center)
-                    .render(info_layout, f.buffer_mut());
-                let gauge_layout = info_layout
-                    .inner(Margin {
-                        horizontal: 1,
-                        vertical: 1,
-                    })
-                    .centered_vertically(Constraint::Percentage(50));
+        } else if let Some(file) = file {
+            Block::bordered()
+                .style(Style::default().yellow().on_blue())
+                .title_top(format!(
+                    "{} - {}:{}",
+                    PathBuf::from(&file.1)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    format_time(playback_time as u32),
+                    format_time(file.0.properties().duration().as_secs() as u32),
+                ))
+                .title_alignment(HorizontalAlignment::Center)
+                .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek]")
+                .title_alignment(HorizontalAlignment::Center)
+                .render(info_layout, f.buffer_mut());
+            let gauge_layout = info_layout
+                .inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                })
+                .centered_vertically(Constraint::Percentage(50));
 
-                Gauge::default()
-                    .block(Block::bordered().style(Style::default().yellow().on_blue()))
-                    .ratio(playback_time / file.0.properties().duration().as_secs_f64())
-                    .render(gauge_layout, f.buffer_mut());
-            }
+            Gauge::default()
+                .block(Block::bordered().style(Style::default().yellow().on_blue()))
+                .ratio(playback_time / file.0.properties().duration().as_secs_f64())
+                .render(gauge_layout, f.buffer_mut());
         }
     }
 
@@ -823,6 +872,7 @@ impl YoutubeRs {
         let fetcher = Self::get_fetcher(args).await?;
         let safe_name =
             video_name.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
+        let vid_info = fetcher.fetch_video_infos(url.to_string()).await?;
         let downloaded = fetcher
             .download_audio_stream_with_quality(
                 url.to_string(),
@@ -832,6 +882,38 @@ impl YoutubeRs {
             )
             .await?;
         println!("Audio downloaded at '{downloaded:?}'");
+        let tagged_file = Probe::open(&downloaded)?;
+        let file_type = tagged_file.guess_file_type()?;
+        let mut tagged_file = file_type.read()?;
+        let tag = match tagged_file.primary_tag_mut() {
+            Some(tag) => tag,
+            None => {
+                if let Some(first_tag) = tagged_file.first_tag_mut() {
+                    first_tag
+                } else {
+                    let tag_type = tagged_file.primary_tag_type();
+                    tagged_file.insert_tag(Tag::new(tag_type));
+                    tagged_file.primary_tag_mut().unwrap()
+                }
+            }
+        };
+        tag.set_title(vid_info.title);
+        tag.set_artist(vid_info.channel);
+        tag.set_genre(vid_info.tags.iter().map(|v| v.clone()).collect());
+        let thumbnail = reqwest::Client::new()
+            .get(vid_info.thumbnail)
+            .send()
+            .await?
+            .bytes()
+            .await?;
+        tag.push_picture(
+            Picture::unchecked(thumbnail.to_vec())
+                .mime_type(lofty::picture::MimeType::Jpeg)
+                .pic_type(lofty::picture::PictureType::CoverFront)
+                .build(),
+        );
+        tag.save_to_path(downloaded, WriteOptions::default())?;
+
         Ok(())
     }
 
@@ -1118,12 +1200,40 @@ impl YoutubeRs {
         }
     }
     fn ytdlp_exist(args: &Cli) -> bool {
-        Self::get_libs(args).youtube.exists()
+        if cfg!(target_os = "windows") {
+            PathBuf::from(format!(
+                "{}.exe",
+                Self::get_libs(args).youtube.to_string_lossy()
+            ))
+            .exists()
+        } else {
+            Self::get_libs(args).youtube.exists()
+        }
     }
     fn ffmpeg_check(args: &Cli) -> bool {
-        Self::get_libs(args).ffmpeg.exists()
+        if cfg!(target_os = "windows") {
+            PathBuf::from(format!(
+                "{}.exe",
+                Self::get_libs(args).ffmpeg.to_string_lossy()
+            ))
+            .exists()
+        } else {
+            Self::get_libs(args).ffmpeg.exists()
+        }
     }
-    fn check_libraries(&mut self, args: &Cli) -> bool {
+    fn libraries_exist(&mut self, args: &Cli) -> bool {
+        if !Self::ytdlp_exist(args) {
+            println!(
+                "YT-DLP not found at '{}'",
+                Self::get_libs(args).youtube.to_string_lossy()
+            );
+        }
+        if !Self::ffmpeg_check(args) {
+            println!(
+                "FFMPEG not found at '{}'",
+                Self::get_libs(args).ffmpeg.to_string_lossy()
+            );
+        }
         Self::ytdlp_exist(args) && Self::ffmpeg_check(args)
     }
 

@@ -15,9 +15,10 @@ async fn main() -> Result<()> {
     let mut app: Option<YoutubeRs> = None;
     match &args.command {
         Some(cli::AppActionCli::Download { query, url }) => {
+            let mut builder = YoutubeRs::builder();
             if let Some(query) = query {
                 app = Some(
-                    YoutubeRs::builder()
+                    builder
                         .api(None, true)
                         .prompt_download()
                         .prompt_format()
@@ -26,30 +27,40 @@ async fn main() -> Result<()> {
                 );
             } else if let Some(url) = url {
                 app = Some(
-                    YoutubeRs::builder()
+                    builder
                         .prompt_download()
                         .prompt_format()
                         .url(url.clone())
                         .build(cloned),
                 );
+            } else {
+                app = Some(
+                    builder
+                        .api(None, true)
+                        .prompt_download()
+                        .prompt_format()
+                        .build(cloned),
+                )
             }
         }
-        Some(cli::AppActionCli::Player { file, url }) => {
+        Some(cli::AppActionCli::Player { file, url, api }) => {
+            let mut builder = YoutubeRs::builder();
             if let Some(file) = file {
-                app = Some(
-                    YoutubeRs::builder()
-                        .player()
-                        .file(file.to_path_buf())
-                        .build(cloned),
-                );
+                app = Some(builder.player().file(file.to_path_buf()).build(cloned));
             } else if let Some(url) = url {
-                app = Some(
-                    YoutubeRs::builder()
-                        .api(None, true)
-                        .player()
-                        .url(url.clone())
-                        .build(cloned),
-                );
+                builder.prompt_player();
+                let is_music = if let Some(api) = api {
+                    match api {
+                        cli::PlayerAPI::Video => Some(false),
+                        cli::PlayerAPI::Music => Some(true),
+                    }
+                } else {
+                    None
+                };
+                app = Some(builder.api(is_music, true).url(url.clone()).build(cloned));
+            } else {
+                builder.player();
+                app = Some(builder.prompt_player().build(cloned));
             }
         }
         Some(cli::AppActionCli::Transcript {
@@ -57,19 +68,21 @@ async fn main() -> Result<()> {
             summarize,
             url,
         }) => {
+            let mut builder = YoutubeRs::builder();
+            builder.transcript();
             if let Some(query) = query {
-                let mut builder = YoutubeRs::builder();
-                builder.transcript().query(query);
+                builder.query(query);
                 if let Some(b) = summarize {
                     builder.do_summarize(b.clone());
                 }
                 app = Some(builder.build(cloned));
             } else if let Some(url) = url {
-                let mut builder = YoutubeRs::builder();
-                builder.transcript().url(url);
+                builder.url(url);
                 if let Some(b) = summarize {
                     builder.do_summarize(b.clone());
                 }
+                app = Some(builder.build(cloned));
+            } else {
                 app = Some(builder.build(cloned));
             }
         }
