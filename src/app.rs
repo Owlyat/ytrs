@@ -1,3 +1,4 @@
+use crate::ARGS;
 use crate::mpv::{MpvIpc, MpvSpawnOptions};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Timelike, Utc};
@@ -320,7 +321,7 @@ impl YoutubeRs {
                                 format_time(response.get_duration()),
                             ))
                             .title_alignment(HorizontalAlignment::Center)
-                            .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek | 'o' YtSearch]")
+                            .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek | 'y' Yank URL |'o' YtSearch]")
                             .title_alignment(HorizontalAlignment::Center)
                             .render(info_layout, f.buffer_mut());
                         let gauge_layout = info_layout
@@ -811,8 +812,49 @@ impl YoutubeRs {
         Ok(())
     }
     fn get_libs_path() -> (PathBuf, PathBuf) {
-        let exec_dir = PathBuf::from("libs");
-        let output_dir = PathBuf::from("output");
+        let args = ARGS.clone();
+        let exec_dir = if let Some(libs_path) = args.libs_path {
+            libs_path.join("libs")
+        } else {
+            if cfg!(target_os = "windows") {
+                PathBuf::from(env!("USERPROFILE"))
+                    .join(".config")
+                    .join("ytrs")
+                    .join("libs")
+            } else if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+                if let Ok(home_path_str) = std::env::var("HOME") {
+                    PathBuf::from(home_path_str)
+                        .join(".config")
+                        .join("ytrs")
+                        .join("libs")
+                } else {
+                    PathBuf::from("libs")
+                }
+            } else {
+                PathBuf::from("libs")
+            }
+        };
+        let output_dir = if let Some(output) = args.output_path {
+            output.join("output")
+        } else {
+            if cfg!(target_os = "windows") {
+                PathBuf::from(env!("USERPROFILE"))
+                    .join(".config")
+                    .join("ytrs")
+                    .join("output")
+            } else if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+                if let Ok(home_path_str) = std::env::var("Home") {
+                    PathBuf::from(home_path_str)
+                        .join(".config")
+                        .join("ytrs")
+                        .join("output")
+                } else {
+                    PathBuf::from("output")
+                }
+            } else {
+                PathBuf::from("output")
+            }
+        };
         (exec_dir, output_dir)
     }
     fn get_libs() -> Libraries {

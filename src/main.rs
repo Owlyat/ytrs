@@ -1,9 +1,15 @@
 mod app;
+mod cli;
 mod mpv;
 mod utility;
 
+static ARGS: LazyLock<cli::Cli> = LazyLock::new(|| cli::Cli::parse());
+
+use std::sync::LazyLock;
+
 use anyhow::Result;
 use app::*;
+use clap::Parser;
 use strum::IntoEnumIterator;
 
 #[tokio::main]
