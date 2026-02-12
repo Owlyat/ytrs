@@ -1,6 +1,6 @@
 [package]
 name = "ytrs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 include = [
   "src/**/*",
@@ -41,3 +41,4 @@ tokio-util = "0.7"
 unix-timestamp = "0.1"
 inquire-derive = "0.9"
 clap = { version = "4.5", features = ["derive"] }
+lofty = "0.23"
