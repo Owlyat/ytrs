@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
     let mut app: Option<YoutubeRs> = None;
     loop {
         if let Some(current_app) = &mut app
-            && current_app.action.to_string().as_str() == "Player"
+            && current_app.action.is_player()
         {
             current_app.process().await?;
             continue;
@@ -21,38 +21,27 @@ async fn main() -> Result<()> {
             inquire::Select::new("Select Action", AppAction::iter().collect()).prompt()?;
         match res {
             AppAction::Download { format: _ } => {
-                let fmt =
-                    inquire::Select::new("Select Audio or Video", Format::variants()).prompt()?;
-                res = AppAction::Download {
-                    format: Format::from(fmt),
-                };
+                let fmt = FormatInquire::select("Select Audio or Video").prompt()?;
+                let mut format = Format::from(fmt);
+                match &mut format {
+                    Format::Audio { format } => {
+                        *format = AudioFormat::select("Select Audio Format").prompt()?
+                    }
+                    Format::Video { format } => {
+                        *format = VideoFormat::select("Select Video Format").prompt()?
+                    }
+                }
+                res = AppAction::Download { format };
             }
             AppAction::Transcript => {}
             AppAction::Player { format: _ } => {
-                let fmt =
-                    inquire::Select::new("Select Audio or Video", Format::variants()).prompt()?;
-                match fmt.as_str() {
-                    "Video" => {
-                        res = AppAction::Player {
-                            format: Format::Video {
-                                format: Default::default(),
-                            },
-                        }
-                    }
-                    "Audio" => {
-                        res = AppAction::Player {
-                            format: Format::Audio {
-                                format: Default::default(),
-                            },
-                        }
-                    }
-                    _ => {}
-                }
+                let fmt = FormatInquire::select("Select Audio or Video").prompt()?;
+                res = AppAction::Player { format: fmt.into() }
             }
             AppAction::Quit => break,
         }
         if api.is_none() {
-            api = Some(inquire::Select::new("Select API", YoutubeAPI::iter().collect()).prompt()?);
+            api = Some(YoutubeAPI::select("Select API").prompt().unwrap());
         }
 
         app = Some(YoutubeRs {

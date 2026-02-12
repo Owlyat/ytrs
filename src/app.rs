@@ -1,20 +1,18 @@
 use crate::mpv::{MpvIpc, MpvSpawnOptions};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Timelike, Utc};
 use image::DynamicImage;
 use inquire::{Confirm, Select, Text as InquireText, validator::Validation};
+use inquire_derive::Selectable;
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ratatui::layout::Flex;
 use ratatui::prelude::*;
-use ratatui::widgets::Gauge;
+use ratatui::style::Stylize;
+use ratatui::widgets::{Gauge, List, ListItem, ListState};
 use ratatui::{
-    crossterm::{
-        event::{KeyCode, read},
-        style::Stylize,
-    },
+    crossterm::event::{KeyCode, read},
     layout::{Constraint, Layout},
-    style::Style,
     widgets::{Block, Paragraph},
 };
 use ratatui_image::{StatefulImage, picker};
@@ -43,7 +41,7 @@ pub struct YoutubeRs {
     pub last_search: Option<String>,
 }
 
-#[derive(strum::Display, strum::EnumIter, Clone)]
+#[derive(strum::Display, strum::EnumIter, Clone, Copy)]
 pub enum AppAction {
     Download { format: Format },
     Transcript,
@@ -51,27 +49,32 @@ pub enum AppAction {
     Quit,
 }
 
-#[derive(strum::Display, strum::EnumIter, Default, Clone)]
+#[derive(strum::Display, strum::EnumIter, Default, Clone, Selectable, Debug, Copy)]
 pub enum YoutubeAPI {
     Music,
     #[default]
     Video,
 }
+#[derive(Copy, Debug, Selectable, strum::Display, Clone)]
+pub enum FormatInquire {
+    Audio,
+    Video,
+}
 
-#[derive(strum::Display, strum::EnumIter, Clone, PartialEq)]
+#[derive(strum::Display, strum::EnumIter, Clone, PartialEq, Copy)]
 pub enum Format {
     Audio { format: AudioFormat },
     Video { format: VideoFormat },
 }
 
-#[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq)]
+#[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq, Copy, Debug, Selectable)]
 pub enum AudioFormat {
     #[default]
     MP3,
     WAV,
 }
 
-#[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq)]
+#[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq, Copy, Selectable, Debug)]
 pub enum VideoFormat {
     #[default]
     MP4,
@@ -94,6 +97,7 @@ pub struct TrackInfo {
     view_count: Option<u64>,
 }
 
+#[derive(Clone)]
 pub enum YoutubeResponse {
     Video(VideoItem),
     Track(TrackItem),
@@ -128,17 +132,11 @@ impl YoutubeResponse {
     }
 }
 
-impl Format {
-    pub fn variants() -> Vec<String> {
-        Self::iter().map(|v| v.to_string()).collect()
-    }
-}
-
 impl YoutubeRs {
     pub async fn process(&mut self) -> Result<()> {
         match self.action.clone() {
             AppAction::Download { format } => {
-                if !self.check_ytdlp()? {
+                if !self.check_libraries() {
                     Self::install_lib().await?;
                 }
                 let (video_id, video_name) = match self.api {
@@ -164,7 +162,7 @@ impl YoutubeRs {
                 }
             }
             AppAction::Transcript => {
-                if !self.check_ytdlp()? {
+                if !self.check_libraries() {
                     Self::install_lib().await?;
                 }
                 let video_id = match self.api {
@@ -185,7 +183,7 @@ impl YoutubeRs {
                 if !self.mpv_installed {
                     self.mpv_installed = Self::check_mpv()?;
                 }
-                let response = match self.api {
+                let mut response = match self.api {
                     YoutubeAPI::Music => {
                         let res = Self::query_ytmusic(self.last_search.clone()).await?;
                         self.last_search = Some(res.1);
@@ -199,12 +197,14 @@ impl YoutubeRs {
                 };
                 match format {
                     Format::Audio { .. } => {
-                        let opt_thumbnail = Self::fetch_yt_thumbnail(&response.get_id()).await.ok();
-                        self.player(response, opt_thumbnail, true).await;
+                        let mut opt_thumbnail =
+                            Self::fetch_yt_thumbnail(&response.get_id()).await.ok();
+                        self.player(&mut response, &mut opt_thumbnail, true).await;
                     }
                     Format::Video { .. } => {
-                        let opt_thumbnail = Self::fetch_yt_thumbnail(&response.get_id()).await.ok();
-                        self.player(response, opt_thumbnail, false).await;
+                        let mut opt_thumbnail =
+                            Self::fetch_yt_thumbnail(&response.get_id()).await.ok();
+                        self.player(&mut response, &mut opt_thumbnail, false).await;
                     }
                 }
             }
@@ -214,8 +214,8 @@ impl YoutubeRs {
     }
     async fn player(
         &mut self,
-        response: YoutubeResponse,
-        opt_thumbnail: Option<DynamicImage>,
+        response: &mut YoutubeResponse,
+        opt_thumbnail: &mut Option<DynamicImage>,
         audio_only: bool,
     ) {
         let opts = MpvSpawnOptions::default();
@@ -236,6 +236,8 @@ impl YoutubeRs {
         let mut loader_idx = 0;
         let mut pause_state = false;
         let mut open_popup = false;
+        let mut videos_list: Vec<(String, YoutubeResponse)> = Vec::new();
+        let mut selected_list_item = ListState::default();
         let mut popup_query = String::new();
         let mut img = if let Some(dyn_thumbnail) = &opt_thumbnail
             && let Ok(picker) = picker::Picker::from_query_stdio()
@@ -280,8 +282,34 @@ impl YoutubeRs {
                     let info_layout = layout[1];
                     let info_layout = info_layout.centered_horizontally(Constraint::Percentage(50));
                     if open_popup {
-                        Paragraph::new(format!("Open: {popup_query}"))
-                            .render(info_layout, f.buffer_mut());
+                        let areas = Layout::vertical([Constraint::Length(3), Constraint::Fill(3)])
+                            .split(info_layout);
+                        Paragraph::new(format!("YTSearch: {popup_query}"))
+                            .block(
+                                Block::bordered()
+                                    .title_top("Search")
+                                    .title_alignment(HorizontalAlignment::Center)
+                                    .yellow()
+                                    .on_blue(),
+                            )
+                            .render(areas[0], f.buffer_mut());
+                        let list = List::new(
+                            videos_list
+                                .iter()
+                                .map(|v| ListItem::from(v.0.clone()))
+                                .collect::<Vec<ListItem>>(),
+                        )
+                        .block(
+                            Block::bordered()
+                                .title_bottom(
+                                    format!("[▼▲ Select Entry | (Esc) Player | (Enter) Search/Play Entry | Tab Change Api: {}]",self.api),
+                                )
+                                .style(Style::default().yellow().on_blue()),
+                        )
+                        .highlight_symbol(">")
+                        .highlight_style(Style::default().red().on_cyan())
+                        .direction(ratatui::widgets::ListDirection::TopToBottom);
+                        f.render_stateful_widget(list, areas[1], &mut selected_list_item);
                     } else {
                         Block::bordered()
                             .style(Style::default().on_blue().yellow())
@@ -292,7 +320,8 @@ impl YoutubeRs {
                                 format_time(response.get_duration()),
                             ))
                             .title_alignment(HorizontalAlignment::Center)
-                            .title_bottom("['q' Quit | 🔼🔽 Volume(+/-) | ⬅️➡️ Seek]")
+                            .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek | 'o' YtSearch]")
+                            .title_alignment(HorizontalAlignment::Center)
                             .render(info_layout, f.buffer_mut());
                         let gauge_layout = info_layout
                             .inner(Margin {
@@ -330,47 +359,86 @@ impl YoutubeRs {
                     {
                         popup_query.pop();
                     }
+                    if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Tab {
+                        self.api = match self.api {
+                            YoutubeAPI::Music => YoutubeAPI::Video,
+                            YoutubeAPI::Video => YoutubeAPI::Music,
+                        };
+                    }
+                    if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Up {
+                        selected_list_item.select_previous();
+                    }
+                    if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Down {
+                        selected_list_item.select_next();
+                    }
                     if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Esc {
                         open_popup = !open_popup;
                     }
                     if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Enter
                     {
-                        open_popup = !open_popup;
-                        match self.api {
-                            // This is a wip feature (adding a video to the current player)
-                            YoutubeAPI::Music => {
-                                let rp = RustyPipe::new();
-                                let found_videos = rp
-                                    .query()
-                                    .unauthenticated()
-                                    .music_search_tracks(popup_query.clone())
-                                    .await
-                                    .context("Failed to search YouTube Music")
-                                    .expect("Failed to fetch youtube with rustypipe");
-                                YoutubeRs::cleanup_rustypipe_cache();
-                                let _found_videos_str: Vec<String> = found_videos
-                                    .clone()
-                                    .items
-                                    .items
-                                    .into_iter()
-                                    .map(|track| TrackInfo::from(&track).to_string())
-                                    .collect();
+                        if let Some(selected) = selected_list_item.selected() {
+                            if let Some(vid) = videos_list.get(selected).map(|v| v.1.clone()) {
+                                popup_query.clear();
+                                mpv.send_command(json!([
+                                    "loadfile",
+                                    Self::get_video_url(&vid.get_id())
+                                ]))
+                                .await
+                                .context("Failed to load media")
+                                .expect("Could not send command to MPV");
+                                if let Ok(thumbnail) = Self::fetch_yt_thumbnail(&vid.get_id()).await
+                                {
+                                    img = if let Ok(picker) = picker::Picker::from_query_stdio() {
+                                        let protocol =
+                                            picker.new_resize_protocol(thumbnail.clone());
+                                        Some(protocol)
+                                    } else {
+                                        None
+                                    };
+                                } else {
+                                    img = None;
+                                }
+                                *response = vid;
+                                videos_list.clear();
                             }
-                            YoutubeAPI::Video => {
-                                let found_videos = RustyPipe::new()
-                                    .query()
-                                    .unauthenticated()
-                                    .search(popup_query.clone())
-                                    .await
-                                    .context("Failed to search YouTube")
-                                    .unwrap();
-                                YoutubeRs::cleanup_rustypipe_cache();
-                                let mut _videos: Vec<String> = found_videos
-                                    .items
-                                    .items
-                                    .iter()
-                                    .map(|v: &VideoItem| VideoInfo::from(v).to_string())
-                                    .collect();
+                        } else {
+                            match self.api {
+                                YoutubeAPI::Music => {
+                                    let rp = RustyPipe::new();
+                                    let found_videos = rp
+                                        .query()
+                                        .unauthenticated()
+                                        .music_search_tracks(popup_query.clone())
+                                        .await
+                                        .context("Failed to search YouTube Music")
+                                        .expect("Failed to fetch youtube with rustypipe");
+                                    YoutubeRs::cleanup_rustypipe_cache();
+                                    videos_list = found_videos
+                                        .clone()
+                                        .items
+                                        .items
+                                        .into_iter()
+                                        .map(|track| {
+                                            (TrackInfo::from(&track).to_string(), track.into())
+                                        })
+                                        .collect();
+                                }
+                                YoutubeAPI::Video => {
+                                    let found_videos = RustyPipe::new()
+                                        .query()
+                                        .unauthenticated()
+                                        .search(popup_query.clone())
+                                        .await
+                                        .context("Failed to search YouTube")
+                                        .unwrap();
+                                    YoutubeRs::cleanup_rustypipe_cache();
+                                    videos_list = found_videos
+                                        .items
+                                        .items
+                                        .iter()
+                                        .map(|v| (VideoInfo::from(v).to_string(), v.into()))
+                                        .collect();
+                                }
                             }
                         }
                     }
@@ -430,7 +498,15 @@ impl YoutubeRs {
     }
 
     async fn fetch_yt_thumbnail(video_id: &str) -> Result<DynamicImage> {
-        let thumbnail_url = format!("https://img.youtube.com/vi/{video_id}/hqdefault.jpg");
+        let thumbnail_url = if Self::ytdlp_exist() {
+            Self::get_fetcher()
+                .await?
+                .fetch_video_infos(String::from(video_id))
+                .await?
+                .thumbnail
+        } else {
+            format!("https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
+        };
         let thumbnail_bytes = reqwest::Client::new()
             .get(&thumbnail_url)
             .send()
@@ -441,12 +517,7 @@ impl YoutubeRs {
     }
 
     async fn download_audio(&self, url: &str, video_name: &str, format: AudioFormat) -> Result<()> {
-        let libraries_dir = PathBuf::from("libs");
-        let output_dir = PathBuf::from("output");
-        let youtube = libraries_dir.join("yt-dlp");
-        let ffmpeg = libraries_dir.join("ffmpeg");
-        let libraries = Libraries::new(youtube, ffmpeg);
-        let fetcher = Youtube::new(libraries, output_dir).await?;
+        let fetcher = Self::get_fetcher().await?;
         let safe_name =
             video_name.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
         let downloaded = fetcher
@@ -462,12 +533,7 @@ impl YoutubeRs {
     }
 
     async fn download_video(&self, url: &str, video_name: &str, format: VideoFormat) -> Result<()> {
-        let libraries_dir = PathBuf::from("libs");
-        let output_dir = PathBuf::from("output");
-        let youtube = libraries_dir.join("yt-dlp");
-        let ffmpeg = libraries_dir.join("ffmpeg");
-        let libraries = Libraries::new(youtube, ffmpeg);
-        let fetcher = Youtube::new(libraries, output_dir).await?;
+        let fetcher = Self::get_fetcher().await?;
         let safe_name =
             video_name.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
         let downloaded = fetcher
@@ -485,14 +551,7 @@ impl YoutubeRs {
     }
 
     async fn download_transcript(&self, video_id: &str) -> Result<()> {
-        let libraries_dir = PathBuf::from("libs");
-        let output_dir = PathBuf::from("output");
-
-        let youtube = libraries_dir.join("yt-dlp");
-        let ffmpeg = libraries_dir.join("ffmpeg");
-
-        let libraries = Libraries::new(youtube, ffmpeg);
-        let fetcher = Youtube::new(libraries, &output_dir).await?;
+        let fetcher = Self::get_fetcher().await?;
 
         let url = format!("https://www.youtube.com/watch?v={video_id}");
         let video = fetcher.fetch_video_infos(url).await?;
@@ -512,18 +571,33 @@ impl YoutubeRs {
                 }
                 return Ok(());
             }
-            let lang = inquire::Select::new(
+            let lang = match inquire::Select::new(
                 "Generated Lang",
                 cap.iter().map(|(lang, _)| lang.clone()).collect(),
             )
-            .prompt()?;
+            .prompt()
+            {
+                Ok(l) => l,
+                Err(e) => match e {
+                    inquire::InquireError::OperationCanceled => Err(anyhow!(YtrsError::Quit))?,
+                    _ => Err(e)?,
+                },
+            };
             for (l, cap) in cap {
                 if lang == l {
                     let res: Vec<Subtitle> = cap
                         .iter()
                         .map(|v| Subtitle::from_automatic_caption(v, l.clone()))
                         .collect();
-                    let res_to_dl = inquire::Select::new("Caption", res).prompt()?;
+                    let res_to_dl = match inquire::Select::new("Caption", res).prompt() {
+                        Ok(res) => res,
+                        Err(e) => match e {
+                            inquire::InquireError::OperationCanceled => {
+                                Err(anyhow!(YtrsError::Quit))?
+                            }
+                            _ => Err(e)?,
+                        },
+                    };
                     let response = reqwest::Client::new()
                         .get(res_to_dl.url.clone())
                         .send()
@@ -539,20 +613,38 @@ impl YoutubeRs {
                         "AutoGenerated Captions downloaded at 'output/subtitle_{l}.{}'",
                         res_to_dl.file_extension()
                     );
-                    let res = inquire::Confirm::new("Summarize with ai ?")
+                    let res = match inquire::Confirm::new("Summarize with ai ?")
                         .with_starting_input("N")
-                        .prompt()?;
+                        .prompt()
+                    {
+                        Ok(b) => b,
+                        Err(e) => match e {
+                            inquire::InquireError::OperationCanceled => {
+                                Err(anyhow!(YtrsError::Quit))?
+                            }
+                            _ => Err(e)?,
+                        },
+                    };
                     if res {
                         use tokio::io::{self, AsyncWriteExt};
                         use tokio_stream::StreamExt;
 
                         let ollama = Ollama::default();
                         let models = ollama.list_local_models().await?;
-                        let model = inquire::Select::new(
+                        let model = match inquire::Select::new(
                             "Which LLM to use:",
                             models.iter().map(|llm| llm.name.clone()).collect(),
                         )
-                        .prompt()?;
+                        .prompt()
+                        {
+                            Ok(v) => v,
+                            Err(e) => match e {
+                                inquire::InquireError::OperationCanceled => {
+                                    Err(anyhow!(YtrsError::Quit))?
+                                }
+                                _ => Err(e)?,
+                            },
+                        };
                         println!("Generating response ...\n");
                         let mut stream = ollama.generate_stream(GenerationRequest::new(
                             model,
@@ -574,7 +666,13 @@ impl YoutubeRs {
         }
         println!("Finding Subtitles");
 
-        let selected_lang = inquire::Select::new("Lang", languages).prompt()?;
+        let selected_lang = match inquire::Select::new("Lang", languages).prompt() {
+            Ok(v) => v,
+            Err(e) => match e {
+                inquire::InquireError::OperationCanceled => Err(anyhow!(YtrsError::Quit))?,
+                _ => Err(e)?,
+            },
+        };
         // Download English subtitles
         let subtitle_path = fetcher
             .download_subtitle(
@@ -622,13 +720,13 @@ impl YoutubeRs {
             .items
             .items
             .into_iter()
-            .map(|track| TrackInfo::from(&track).to_string())
+            .map(|track| TrackInfo::from(&track).colored())
             .collect();
-        found_videos_str.push("Exit".to_owned());
+        found_videos_str.push("Exit".red().to_string());
         let selected_vid_str = Select::new("Select Music", found_videos_str)
             .prompt()
             .context("Failed to select music")?;
-        if selected_vid_str == "Exit" {
+        if selected_vid_str == "Exit".red().to_string().as_str() {
             let confirm = Confirm::new("Exit application?")
                 .with_default(true)
                 .prompt()?;
@@ -640,7 +738,7 @@ impl YoutubeRs {
             .items
             .items
             .into_iter()
-            .find(|track| TrackInfo::from(track).to_string() == selected_vid_str)
+            .find(|track| TrackInfo::from(track).colored() == selected_vid_str)
         {
             Ok((vid, search_term))
         } else {
@@ -660,15 +758,15 @@ impl YoutubeRs {
             .items
             .items
             .iter()
-            .map(|v: &VideoItem| VideoInfo::from(v).to_string())
+            .map(|v: &VideoItem| VideoInfo::from(v).colored())
             .collect();
-        videos.push("Exit".to_owned());
+        videos.push("Exit".red().to_string());
 
         let video_entry = Select::new("Select video to watch", videos)
             .with_help_message("Type to filter | Arrow keys to navigate | Enter to select")
             .prompt()
             .context("Failed to select video")?;
-        if video_entry == "Exit" {
+        if video_entry == "Exit".red().to_string().as_str() {
             let confirm = Confirm::new("Exit application?")
                 .with_default(true)
                 .prompt()?;
@@ -680,7 +778,7 @@ impl YoutubeRs {
             .items
             .items
             .into_iter()
-            .find(|v| VideoInfo::from(v).to_string() == video_entry);
+            .find(|v| VideoInfo::from(v).colored() == video_entry);
         if let Some(vid) = selected_vid {
             Ok((vid, search_term))
         } else {
@@ -696,46 +794,48 @@ impl YoutubeRs {
             Err(_) => Err(YtrsError::MpvNotFound.into()),
         }
     }
-    fn check_ytdlp(&mut self) -> Result<bool> {
-        let libs_dir = PathBuf::from("libs");
-
-        let ytdlp_exists = libs_dir.join("yt-dlp.exe").exists() || libs_dir.join("yt-dlp").exists();
-
-        let mut ffmpeg_exists = false;
-        if libs_dir.exists()
-            && let Ok(entries) = std::fs::read_dir(&libs_dir)
-        {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    let bin_path = entry.path().join("bin").join("ffmpeg.exe");
-                    if bin_path.exists() {
-                        ffmpeg_exists = true;
-                        break;
-                    }
-
-                    if entry.path().join("ffmpeg.exe").exists()
-                        || entry.path().join("ffmpeg").exists()
-                    {
-                        ffmpeg_exists = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if libs_dir.join("ffmpeg.exe").exists() || libs_dir.join("ffmpeg").exists() {
-            ffmpeg_exists = true;
-        }
-
-        Ok(ytdlp_exists && ffmpeg_exists)
+    fn ytdlp_exist() -> bool {
+        Self::get_libs().youtube.exists()
+    }
+    fn ffmpeg_check() -> bool {
+        Self::get_libs().ffmpeg.exists()
+    }
+    fn check_libraries(&mut self) -> bool {
+        Self::ytdlp_exist() && Self::ffmpeg_check()
     }
 
     async fn install_lib() -> Result<()> {
         println!("Installing Libraries");
-        let exec_dir = PathBuf::from("libs");
-        let output_dir = PathBuf::from("output");
+        let (exec_dir, output_dir) = Self::get_libs_path();
         let _ = Youtube::with_new_binaries(exec_dir, output_dir).await?;
         Ok(())
+    }
+    fn get_libs_path() -> (PathBuf, PathBuf) {
+        let exec_dir = PathBuf::from("libs");
+        let output_dir = PathBuf::from("output");
+        (exec_dir, output_dir)
+    }
+    fn get_libs() -> Libraries {
+        let (libs, _) = Self::get_libs_path();
+        let youtube = libs.join("yt-dlp");
+        let ffmpeg = libs.join("ffmpeg");
+        Libraries::new(youtube, ffmpeg)
+    }
+    async fn get_fetcher() -> Result<Youtube> {
+        let (_, out) = Self::get_libs_path();
+        let libs = Self::get_libs();
+        Youtube::new(libs, out)
+            .await
+            .context("Failed to retrieve Youtube Fetcher")
+    }
+}
+
+impl AppAction {
+    pub fn is_player(&self) -> bool {
+        match self {
+            AppAction::Player { .. } => true,
+            _ => false,
+        }
     }
 }
 
@@ -749,10 +849,9 @@ impl From<&VideoItem> for VideoInfo {
         }
     }
 }
-impl std::fmt::Display for VideoInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
+impl VideoInfo {
+    pub fn colored(&self) -> String {
+        format!(
             "Video name: [{}]{}{}",
             self.name.to_string().green(),
             if let Some(d) = self.duration {
@@ -764,6 +863,25 @@ impl std::fmt::Display for VideoInfo {
                 format!("\n\tBy: {}", chan).blue()
             } else {
                 "".to_string().blue()
+            }
+        )
+    }
+}
+impl std::fmt::Display for VideoInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Video name: [{}]{}{}",
+            self.name.to_string(),
+            if let Some(d) = self.duration {
+                format!(" {}", format_time(d))
+            } else {
+                "".to_string()
+            },
+            if let Some(chan) = &self.channel {
+                format!("\n\tBy: {}", chan)
+            } else {
+                "".to_string()
             }
         )
     }
@@ -803,44 +921,6 @@ impl From<String> for VideoFormat {
             .clone()
     }
 }
-impl From<String> for Format {
-    fn from(value: String) -> Self {
-        match Self::variants()
-            .iter()
-            .find(|v| *v == &value)
-            .iter()
-            .next()
-            .unwrap()
-            .as_str()
-        {
-            "Video" => {
-                let format = inquire::Select::new(
-                    "Video Format",
-                    VideoFormat::iter().map(|v| v.to_string()).collect(),
-                )
-                .prompt()
-                .unwrap();
-                Format::Video {
-                    format: VideoFormat::from(format),
-                }
-            }
-            "Audio" => {
-                let format = inquire::Select::new(
-                    "Audio Format",
-                    AudioFormat::iter().map(|v| v.to_string()).collect(),
-                )
-                .prompt()
-                .unwrap();
-                Format::Audio {
-                    format: AudioFormat::from(format),
-                }
-            }
-            _ => {
-                panic!("Invalid Format")
-            }
-        }
-    }
-}
 impl Default for Format {
     fn default() -> Self {
         Self::Audio {
@@ -848,12 +928,11 @@ impl Default for Format {
         }
     }
 }
-impl std::fmt::Display for TrackInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
+impl TrackInfo {
+    pub fn colored(&self) -> String {
+        format!(
             "Track name: '{}'{}{}\n\tArtist(s): [{}]",
-            self.track_name.clone().green(),
+            ratatui::crossterm::style::Stylize::green(self.track_name.clone()),
             match self.duration {
                 Some(d) => {
                     format!(" {}", format_time(d))
@@ -863,10 +942,65 @@ impl std::fmt::Display for TrackInfo {
                 }
             },
             match self.view_count {
-                Some(views) => format!(" Views: {}", views).dark_blue(),
-                None => "".to_owned().dark_blue(),
+                Some(views) =>
+                    ratatui::crossterm::style::Stylize::dark_blue(format!(" Views: {}", views)),
+                None => ratatui::crossterm::style::Stylize::dark_blue("".to_owned()),
             },
-            self.artists.clone().blue()
+            ratatui::crossterm::style::Stylize::blue(self.artists.clone())
         )
+    }
+}
+impl std::fmt::Display for TrackInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Track name: '{}'{}{}\n\tArtist(s): [{}]",
+            self.track_name.clone(),
+            match self.duration {
+                Some(d) => {
+                    format!(" {}", format_time(d))
+                }
+                None => {
+                    "".to_string()
+                }
+            },
+            match self.view_count {
+                Some(views) => format!(" Views: {}", views),
+                None => "".to_owned(),
+            },
+            self.artists.clone()
+        )
+    }
+}
+impl std::fmt::Debug for AppAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Download { .. } => f.debug_struct("Download").finish(),
+            Self::Transcript => write!(f, "Transcript"),
+            Self::Player { .. } => f.debug_struct("Player").finish(),
+            Self::Quit => write!(f, "Quit"),
+        }
+    }
+}
+impl From<FormatInquire> for Format {
+    fn from(value: FormatInquire) -> Self {
+        match value {
+            FormatInquire::Audio => Self::Audio {
+                format: Default::default(),
+            },
+            FormatInquire::Video => Self::Video {
+                format: Default::default(),
+            },
+        }
+    }
+}
+impl From<&VideoItem> for YoutubeResponse {
+    fn from(value: &VideoItem) -> Self {
+        Self::Video(value.clone())
+    }
+}
+impl From<TrackItem> for YoutubeResponse {
+    fn from(value: TrackItem) -> Self {
+        Self::Track(value)
     }
 }
