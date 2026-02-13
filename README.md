@@ -9,8 +9,8 @@
 - Path for linux/macos:
   - `Home\.config\ytrs\libs`
   - `Home\.config\ytrs\output`
-You can provide a flag in the cli to install/download where you want.
 
+You can provide a flag in the cli to install/download where you want.
 Libraries:
 ```
 ytrs -l <Path>
