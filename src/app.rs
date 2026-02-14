@@ -12,6 +12,7 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, Tag, TagExt};
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
+use ratatui::crossterm::event::KeyModifiers;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use ratatui::widgets::{Gauge, List, ListItem, ListState};
@@ -572,7 +573,11 @@ impl YoutubeRs {
             popup_query.push(ch);
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Backspace {
-            popup_query.pop();
+            if event.as_key_event().unwrap().modifiers == KeyModifiers::CONTROL {
+                popup_query.clear();
+            } else {
+                popup_query.pop();
+            }
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Tab {
             self.api = match self.api {
@@ -591,7 +596,9 @@ impl YoutubeRs {
             *open_popup = !*open_popup;
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Enter {
-            if let Some(selected) = selected_list_item.selected() {
+            if let Some(selected) = selected_list_item.selected()
+                && popup_query.is_empty()
+            {
                 if let Some(vid) = videos_list.get(selected).map(|v| v.1.clone()) {
                     popup_query.clear();
                     mpv.send_command(json!(["loadfile", Self::get_video_url(&vid.get_id())]))
@@ -631,6 +638,7 @@ impl YoutubeRs {
                             .into_iter()
                             .map(|track| (TrackInfo::from(&track).to_string(), track.into()))
                             .collect();
+                        popup_query.clear();
                     }
                     Some(YoutubeAPI::Video) => {
                         let found_videos = RustyPipe::new()
@@ -647,6 +655,7 @@ impl YoutubeRs {
                             .iter()
                             .map(|v| (VideoInfo::from(v).to_string(), v.into()))
                             .collect();
+                        popup_query.clear();
                     }
                     None => {}
                 }
