@@ -1,5 +1,4 @@
 use anyhow::{Context, anyhow, bail};
-/* use log::{debug, info, trace, warn}; */
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -8,7 +7,7 @@ use std::fmt::Display;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, WriteHalf};
 use tokio::process::Child;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -16,11 +15,18 @@ use tokio::task::JoinHandle;
 use tokio::{process, time};
 use tokio_util::sync::CancellationToken;
 
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 #[cfg(target_os = "windows")]
 mod mpv_platform {
+    use super::unix_timestamp;
     use std::path::PathBuf;
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-    use unix_timestamp::unix_timestamp;
     pub type Stream = NamedPipeClient;
     pub async fn connect(path: &PathBuf) -> Result<Stream, ()> {
         let opts = ClientOptions::new();
@@ -35,7 +41,7 @@ mod mpv_platform {
 }
 #[cfg(not(target_os = "windows"))]
 mod mpv_platform {
-    use crate::unix_timestamp;
+    use super::unix_timestamp;
     use std::path::PathBuf;
     use tokio::net::UnixStream;
     pub type Stream = UnixStream;
@@ -67,22 +73,12 @@ struct MpvResponse {
 type LockedMpvIdMap<T> = Arc<Mutex<HashMap<usize, T>>>;
 type MpvDataOption = Option<serde_json::Value>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MpvSpawnOptions {
     pub mpv_path: Option<PathBuf>,
     pub ipc_path: Option<PathBuf>,
     pub config_dir: Option<PathBuf>,
     pub inherit_stdout: bool,
-}
-impl Default for MpvSpawnOptions {
-    fn default() -> Self {
-        Self {
-            mpv_path: None,
-            ipc_path: None,
-            config_dir: None,
-            inherit_stdout: false,
-        }
-    }
 }
 
 pub struct MpvIpc {
@@ -163,7 +159,6 @@ impl MpvIpc {
                         } else {
                             tx.send(Err(anyhow!(mpv_resp.error))).unwrap();
                         }
-                    } else {
                     }
                 } else if let Some(event) = json
                     .as_object()
@@ -186,7 +181,6 @@ impl MpvIpc {
                         if let Some(tx) = observers_ref.lock().await.get(&id) {
                             let data = json.as_object().unwrap().get("data").map(|d| d.to_owned());
                             tx.send(data).await.unwrap();
-                        } else {
                         }
                     }
                     if event == "shutdown" {
@@ -194,7 +188,6 @@ impl MpvIpc {
                         // TODO: this should also abort tasks etc
                         break; // stop main loop
                     }
-                } else {
                 }
             }
         });
@@ -216,12 +209,12 @@ impl MpvIpc {
         let mpv_path = opt
             .mpv_path
             .as_ref()
-            .map(|v| std::borrow::Cow::Borrowed(v))
+            .map(std::borrow::Cow::Borrowed)
             .unwrap_or_else(|| std::borrow::Cow::Owned(mpv_platform::default_mpv_bin()));
         let ipc_path = opt
             .ipc_path
             .as_ref()
-            .map(|v| std::borrow::Cow::Borrowed(v))
+            .map(std::borrow::Cow::Borrowed)
             .unwrap_or_else(|| std::borrow::Cow::Owned(mpv_platform::generate_ipc_path()));
         let mut args = vec![
             "--idle".to_owned(),
@@ -255,8 +248,7 @@ impl MpvIpc {
 
         // Sanity check
         let ipc_pid = sself.get_prop::<u32>("pid").await?;
-        if ipc_pid != child_pid {
-        }
+        let _ = ipc_pid != child_pid;
 
         Ok(sself)
     }

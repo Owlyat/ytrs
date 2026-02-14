@@ -1,6 +1,6 @@
 [package]
 name = "ytrs"
-version = "0.1.31"
+version = "0.1.32"
 edition = "2024"
 include = [
   "src/**/*",
@@ -38,7 +38,6 @@ ollama-rs = { version = "0.3", features = ["stream"] }
 tokio-stream = "0.1"
 serde = "1.0"
 tokio-util = "0.7"
-unix-timestamp = "0.1"
 inquire-derive = "0.9"
 clap = { version = "4.5", features = ["derive"] }
 lofty = "0.23"

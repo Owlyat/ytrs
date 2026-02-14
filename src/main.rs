@@ -73,13 +73,13 @@ async fn main() -> Result<()> {
             if let Some(query) = query {
                 builder.query(query);
                 if let Some(b) = summarize {
-                    builder.do_summarize(b.clone());
+                    builder.do_summarize(*b);
                 }
                 app = Some(builder.build(cloned));
             } else if let Some(url) = url {
                 builder.url(url);
                 if let Some(b) = summarize {
-                    builder.do_summarize(b.clone());
+                    builder.do_summarize(*b);
                 }
                 app = Some(builder.build(cloned));
             } else {

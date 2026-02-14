@@ -12,7 +12,6 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, Tag, TagExt};
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
-use ratatui::layout::Flex;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use ratatui::widgets::{Gauge, List, ListItem, ListState};
@@ -41,6 +40,7 @@ use yt_dlp::model::caption::Subtitle;
 
 use crate::utility::format_time;
 
+#[derive(Default)]
 pub struct YoutubeRs {
     pub api: Option<YoutubeAPI>,
     pub action: AppAction,
@@ -96,6 +96,7 @@ pub enum Format {
     Video { format: VideoFormat },
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq, Copy, Debug, Selectable)]
 pub enum AudioFormat {
     #[default]
@@ -103,6 +104,7 @@ pub enum AudioFormat {
     WAV,
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq, Copy, Selectable, Debug)]
 pub enum VideoFormat {
     #[default]
@@ -143,16 +145,12 @@ pub enum YtrsError {
 impl YoutubeRsBuilder {
     pub fn build(&mut self, cli: Cli) -> YoutubeRs {
         YoutubeRs {
-            api: if let Some(api) = self.api {
-                Some(api)
-            } else {
-                None
-            },
+            api: self.api,
             action: self.action.unwrap_or_default(),
             mpv_installed: YoutubeRs::check_mpv().unwrap_or_default(),
             last_search: Some(self.last_search.clone().unwrap_or_default()),
             args: cli,
-            summarize: self.summarize.clone(),
+            summarize: self.summarize,
         }
     }
     pub fn api(&mut self, music: Option<bool>, prompt: bool) -> &mut Self {
@@ -232,15 +230,13 @@ impl YoutubeRsBuilder {
                 .next()
             {
                 if let Some(AppAction::Player { format }) = &mut self.action {
-                    *format = Format::Audio { format: i.clone() };
+                    *format = Format::Audio { format: *i };
                 }
             } else if let Some(i) = VideoFormat::iter()
-                .filter(|vf| vf.to_string().to_lowercase() == ext.to_string_lossy().to_lowercase())
-                .next()
+                .find(|vf| vf.to_string().to_lowercase() == ext.to_string_lossy().to_lowercase())
+                && let Some(AppAction::Player { format }) = &mut self.action
             {
-                if let Some(AppAction::Player { format }) = &mut self.action {
-                    *format = Format::Video { format: i.clone() }
-                }
+                *format = Format::Video { format: i }
             }
         }
         self.last_search = Some(p.to_string_lossy().to_string());
@@ -255,7 +251,7 @@ impl YoutubeRsBuilder {
         } else {
             self.api = Some(YoutubeAPI::select("Select API").prompt().unwrap());
         }
-        self.last_search = Some(url.into());
+        self.last_search = Some(url);
         self
     }
     pub fn query(&mut self, query: impl Into<String>) -> &mut Self {
@@ -268,18 +264,6 @@ impl YoutubeRsBuilder {
     }
 }
 
-impl Default for YoutubeRs {
-    fn default() -> Self {
-        Self {
-            api: Default::default(),
-            action: Default::default(),
-            mpv_installed: Default::default(),
-            last_search: Default::default(),
-            args: Default::default(),
-            summarize: Default::default(),
-        }
-    }
-}
 impl YoutubeResponse {
     pub fn get_id(&self) -> String {
         match self {
@@ -303,7 +287,7 @@ impl YoutubeResponse {
 
 impl YoutubeRs {
     pub async fn process(&mut self) -> Result<()> {
-        match self.action.clone() {
+        match self.action {
             AppAction::Download { format } => {
                 if !self.libraries_exist(&self.args.clone()) {
                     Self::install_lib(&self.args).await?;
@@ -432,21 +416,18 @@ impl YoutubeRs {
                         match file.guess_file_type() {
                             Ok(file) => match file.read() {
                                 Ok(tagged_file) => {
-                                    if let Some(tag) = tagged_file.primary_tag() {
-                                        if let Some(pic) = tag.pictures().first() {
-                                            if let Ok(dyn_img) = image::load_from_memory(pic.data())
-                                            {
-                                                img = if let Ok(picker) =
-                                                    picker::Picker::from_query_stdio()
-                                                {
-                                                    let protocole =
-                                                        picker.new_resize_protocol(dyn_img.clone());
-                                                    Some(protocole)
-                                                } else {
-                                                    None
-                                                };
-                                            }
-                                        }
+                                    if let Some(tag) = tagged_file.primary_tag()
+                                        && let Some(pic) = tag.pictures().first()
+                                        && let Ok(dyn_img) = image::load_from_memory(pic.data())
+                                    {
+                                        img = if let Ok(picker) = picker::Picker::from_query_stdio()
+                                        {
+                                            let protocole =
+                                                picker.new_resize_protocol(dyn_img.clone());
+                                            Some(protocole)
+                                        } else {
+                                            None
+                                        };
                                     }
                                     Some((tagged_file, f.to_string_lossy().to_string()))
                                 }
@@ -555,19 +536,17 @@ impl YoutubeRs {
                         &event,
                     )
                     .await;
-                } else {
-                    if let ControlFlow::Break(_) = self
-                        .handle_playback_event(
-                            response,
-                            &mut mpv,
-                            &mut pause_state,
-                            &mut open_popup,
-                            event,
-                        )
-                        .await
-                    {
-                        break;
-                    }
+                } else if let ControlFlow::Break(_) = self
+                    .handle_playback_event(
+                        response,
+                        &mut mpv,
+                        &mut pause_state,
+                        &mut open_popup,
+                        event,
+                    )
+                    .await
+                {
+                    break;
                 }
             }
         }
@@ -575,6 +554,7 @@ impl YoutubeRs {
         ratatui::restore();
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_popup_event(
         &mut self,
         response: &mut Option<YoutubeResponse>,
@@ -674,6 +654,7 @@ impl YoutubeRs {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &mut self,
         response: &mut Option<YoutubeResponse>,
@@ -682,7 +663,7 @@ impl YoutubeRs {
         loader: [&str; 4],
         loader_idx: &mut usize,
         open_popup: bool,
-        videos_list: &Vec<(String, YoutubeResponse)>,
+        videos_list: &[(String, YoutubeResponse)],
         selected_list_item: &mut ListState,
         popup_query: &String,
         img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
@@ -691,17 +672,32 @@ impl YoutubeRs {
     ) {
         if vid_started {
             // General Layout
-            let layout = Layout::vertical(Constraint::from_percentages([60, 40]))
-                .flex(Flex::SpaceEvenly)
-                .split(f.area());
+            let layout = Layout::vertical(Constraint::from_percentages([60, 40])).split(f.area());
             // Top Image
             if let Some(protocol) = img {
                 let img_layout = layout[0];
+                // remove 50% width on both sides
+                let img_layout = img_layout.centered_horizontally(Constraint::Percentage(50));
+                // Size of the image once resized to the area to fit
+                let img_size = protocol.size_for(ratatui_image::Resize::Scale(None), img_layout);
+                let width_dif = img_layout.width - img_size.width;
+                let height_dif = img_layout.height - img_size.height;
+                let img_place = Rect::new(
+                    img_layout.x + width_dif / 2,
+                    img_layout.y + height_dif / 2,
+                    img_layout.width,
+                    img_layout.height,
+                );
                 f.render_stateful_widget(
-                    StatefulImage::default(),
-                    img_layout.centered(Constraint::Percentage(25), Constraint::Percentage(75)),
+                    StatefulImage::default().resize(ratatui_image::Resize::Scale(None)),
+                    img_place,
                     protocol,
                 );
+                if let Some(x) = protocol.last_encoding_result()
+                    && let Err(e) = x
+                {
+                    panic!("Error with last encoding result for image '{e}'");
+                }
             }
 
             // Bottom Panel
@@ -731,7 +727,7 @@ impl YoutubeRs {
 
     fn render_yt_search_popup(
         &mut self,
-        videos_list: &Vec<(String, YoutubeResponse)>,
+        videos_list: &[(String, YoutubeResponse)],
         selected_list_item: &mut ListState,
         popup_query: &String,
         f: &mut Frame<'_>,
@@ -899,7 +895,7 @@ impl YoutubeRs {
         };
         tag.set_title(vid_info.title);
         tag.set_artist(vid_info.channel);
-        tag.set_genre(vid_info.tags.iter().map(|v| v.clone()).collect());
+        tag.set_genre(vid_info.tags.iter().cloned().collect());
         let thumbnail = reqwest::Client::new()
             .get(vid_info.thumbnail)
             .send()
@@ -1154,10 +1150,10 @@ impl YoutubeRs {
             .await
             .context("Failed to search YouTube")?;
         Self::cleanup_rustypipe_cache();
-        if found_videos.items.items.len() == 1 {
-            if let Some(item) = found_videos.items.items.get(0) {
-                return Ok((item.clone(), opt_search.clone().unwrap_or_default()));
-            }
+        if found_videos.items.items.len() == 1
+            && let Some(item) = found_videos.items.items.first()
+        {
+            return Ok((item.clone(), opt_search.clone().unwrap_or_default()));
         }
         let mut videos: Vec<String> = found_videos
             .items
@@ -1243,6 +1239,7 @@ impl YoutubeRs {
         let _ = Youtube::with_new_binaries(exec_dir, output_dir).await?;
         Ok(())
     }
+    #[cfg(target_os = "windows")]
     fn get_libs_path(args: &Cli) -> (PathBuf, PathBuf) {
         let exec_dir = if let Some(libs_path) = &args.libs_path {
             libs_path.join("libs")
@@ -1288,6 +1285,55 @@ impl YoutubeRs {
         };
         (exec_dir, output_dir)
     }
+
+    #[cfg(target_os = "linux")]
+    fn get_libs_path(args: &Cli) -> (PathBuf, PathBuf) {
+        let exec_dir = if let Some(libs_path) = &args.libs_path {
+            libs_path.join("libs")
+        } else if let Ok(home_path_str) = std::env::var("HOME") {
+            PathBuf::from(home_path_str)
+                .join(".config")
+                .join("ytrs")
+                .join("libs")
+        } else {
+            PathBuf::from("libs")
+        };
+        let output_dir = if let Some(output) = &args.output_path {
+            output.join("output")
+        } else if let Ok(home_path_str) = std::env::var("HOME") {
+            PathBuf::from(home_path_str)
+                .join(".config")
+                .join("ytrs")
+                .join("output")
+        } else {
+            PathBuf::from("output")
+        };
+        (exec_dir, output_dir)
+    }
+    #[cfg(target_os = "macos")]
+    fn get_libs_path(args: &Cli) -> (PathBuf, PathBuf) {
+        let exec_dir = if let Some(libs_path) = &args.libs_path {
+            libs_path.join("libs")
+        } else if let Ok(home_path_str) = std::env::var("HOME") {
+            PathBuf::from(home_path_str)
+                .join(".config")
+                .join("ytrs")
+                .join("libs")
+        } else {
+            PathBuf::from("libs")
+        };
+        let output_dir = if let Some(output) = &args.output_path {
+            output.join("output")
+        } else if let Ok(home_path_str) = std::env::var("HOME") {
+            PathBuf::from(home_path_str)
+                .join(".config")
+                .join("ytrs")
+                .join("output")
+        } else {
+            PathBuf::from("output")
+        };
+        (exec_dir, output_dir)
+    }
     fn get_libs(args: &Cli) -> Libraries {
         let (libs, _) = Self::get_libs_path(args);
         let youtube = libs.join("yt-dlp");
@@ -1312,11 +1358,12 @@ impl YoutubeRs {
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('q') {
             return ControlFlow::Break(());
         }
-        if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('y') {
-            if let Some(res) = response {
-                let current_url = Self::get_video_url(&res.get_id());
-                let _ = Self::clipboard(&current_url);
-            }
+        if event.is_key_press()
+            && event.as_key_event().unwrap().code == KeyCode::Char('y')
+            && let Some(res) = response
+        {
+            let current_url = Self::get_video_url(&res.get_id());
+            let _ = Self::clipboard(&current_url);
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char(' ') {
             *pause_state = !*pause_state;
@@ -1334,10 +1381,11 @@ impl YoutubeRs {
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Down {
             let _ = mpv.send_command(json!(["add", "volume", "-5"])).await;
         }
-        if let Some(_) = response {
-            if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('o') {
-                *open_popup = !*open_popup;
-            }
+        if response.is_some()
+            && event.is_key_press()
+            && event.as_key_event().unwrap().code == KeyCode::Char('o')
+        {
+            *open_popup = !*open_popup;
         }
         ControlFlow::Continue(())
     }
@@ -1366,7 +1414,7 @@ impl std::fmt::Display for VideoInfo {
         write!(
             f,
             "Video name: [{}]{}{}",
-            self.name.to_string(),
+            self.name,
             if let Some(d) = self.duration {
                 format!(" {}", format_time(d))
             } else {
@@ -1394,25 +1442,23 @@ impl From<&TrackItem> for TrackInfo {
 impl From<String> for AudioFormat {
     fn from(value: String) -> Self {
         Self::iter()
-            .map(|v| (v.clone(), v.to_string()))
+            .map(|v| (v, v.to_string()))
             .find(|(_, v_str)| v_str == &value)
             .iter()
             .next()
             .unwrap()
             .0
-            .clone()
     }
 }
 impl From<String> for VideoFormat {
     fn from(value: String) -> Self {
         Self::iter()
-            .map(|v| (v.clone(), v.to_string()))
+            .map(|v| (v, v.to_string()))
             .find(|(_, v_str)| v_str == &value)
             .iter()
             .next()
             .unwrap()
             .0
-            .clone()
     }
 }
 impl Default for Format {
