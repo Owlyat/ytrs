@@ -43,10 +43,21 @@ async fn main() -> Result<()> {
                 )
             }
         }
-        Some(cli::AppActionCli::Player { file, url, api }) => {
+        Some(cli::AppActionCli::Player {
+            file,
+            url,
+            api,
+            midi,
+        }) => {
             let mut builder = YoutubeRs::builder();
             if let Some(file) = file {
-                app = Some(builder.player().file(file.to_path_buf()).build(cloned));
+                app = Some(
+                    builder
+                        .player()
+                        .midi(*midi)
+                        .file(file.to_path_buf())
+                        .build(cloned),
+                );
             } else if let Some(url) = url {
                 builder.prompt_player();
                 let is_music = if let Some(api) = api {
@@ -57,9 +68,15 @@ async fn main() -> Result<()> {
                 } else {
                     None
                 };
-                app = Some(builder.api(is_music, true).url(url.clone()).build(cloned));
+                app = Some(
+                    builder
+                        .api(is_music, true)
+                        .midi(*midi)
+                        .url(url.clone())
+                        .build(cloned),
+                );
             } else {
-                app = Some(builder.audio_player().build(cloned));
+                app = Some(builder.audio_player().midi(*midi).build(cloned));
             }
         }
         Some(cli::AppActionCli::Transcript {

@@ -10,6 +10,7 @@ use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::picture::Picture;
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, Tag, TagExt};
+use midir::{MidiInput, MidiInputPort, MidiOutput, MidiOutputConnection, MidiOutputPort};
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ratatui::crossterm::event::KeyModifiers;
@@ -50,6 +51,7 @@ pub struct YoutubeRs {
     pub summarize: Option<bool>,
     // Enter the player tui directly
     pub player: bool,
+    pub run_midi: bool,
     args: Cli,
 }
 #[derive(Default)]
@@ -62,6 +64,7 @@ pub struct YoutubeRsBuilder {
     cli: Cli,
     // Enter the player tui directly
     pub player: Option<bool>,
+    midi: bool,
 }
 
 impl YoutubeRs {
@@ -157,6 +160,7 @@ impl YoutubeRsBuilder {
             args: cli,
             summarize: self.summarize,
             player: self.player.unwrap_or_default(),
+            run_midi: self.midi,
         }
     }
     pub fn api(&mut self, music: Option<bool>, prompt: bool) -> &mut Self {
@@ -170,6 +174,10 @@ impl YoutubeRsBuilder {
             self.api = Some(YoutubeAPI::select("Select API").prompt().unwrap());
         }
 
+        self
+    }
+    pub fn midi(&mut self, run_midi: bool) -> &mut Self {
+        self.midi = run_midi;
         self
     }
     pub fn action(&mut self, action: Option<AppAction>, cli: Option<AppActionCli>) -> &mut Self {
@@ -381,6 +389,7 @@ impl YoutubeRs {
                             Format::Audio { .. } => true,
                             Format::Video { .. } => false,
                         },
+                        self.run_midi,
                     )
                     .await;
                     return Ok(());
@@ -394,7 +403,8 @@ impl YoutubeRs {
                         } else {
                             None
                         };
-                        self.player(&mut response, &mut opt_thumbnail, true).await;
+                        self.player(&mut response, &mut opt_thumbnail, true, self.run_midi)
+                            .await;
                     }
                     Format::Video { .. } => {
                         let mut opt_thumbnail = if let Some(res) = &response {
@@ -404,7 +414,8 @@ impl YoutubeRs {
                         } else {
                             None
                         };
-                        self.player(&mut response, &mut opt_thumbnail, false).await;
+                        self.player(&mut response, &mut opt_thumbnail, false, self.run_midi)
+                            .await;
                     }
                 }
             }
@@ -417,7 +428,72 @@ impl YoutubeRs {
         response: &mut Option<YoutubeResponse>,
         opt_thumbnail: &mut Option<DynamicImage>,
         audio_only: bool,
+        run_midi: bool,
     ) {
+        let mut midi_in = MidiInput::new("midir reading input").expect("Could not open Midi Input");
+        midi_in.ignore(midir::Ignore::None);
+        let midi_out =
+            MidiOutput::new("midir forwarding output").expect("Could not open Midi Output");
+        let in_port = midi_in.ports();
+        let out_port = midi_out.ports();
+        let opt_midi_in_port: Option<&MidiInputPort> = if !run_midi {
+            None
+        } else {
+            match in_port.len() {
+                0 => None,
+                1 => Some(&in_port[0]),
+                _ => {
+                    let filter = |(i, p): (usize, &MidiInputPort)| -> String {
+                        format!("{i}:{}", midi_in.port_name(p).unwrap())
+                    };
+                    let mut inputs = vec![String::from("None")];
+                    in_port
+                        .iter()
+                        .enumerate()
+                        .for_each(|(i, p)| inputs.push(filter((i, p))));
+                    let res = inquire::Select::new("Select Midi Input Port", inputs)
+                        .prompt()
+                        .unwrap();
+                    let port = in_port
+                        .iter()
+                        .enumerate()
+                        .find(|(i, p)| filter((*i, p)) == res);
+                    match port {
+                        Some(p) => Some(&in_port[p.0]),
+                        None => None,
+                    }
+                }
+            }
+        };
+        let opt_midi_out_port: Option<&MidiOutputPort> = if !run_midi {
+            None
+        } else {
+            match out_port.len() {
+                0 => None,
+                1 => Some(&out_port[0]),
+                _ => {
+                    let filter = |(i, p): (usize, &MidiOutputPort)| -> String {
+                        format!("{i}:{}", midi_out.port_name(p).unwrap())
+                    };
+                    let mut inputs = vec![String::from("None")];
+                    out_port
+                        .iter()
+                        .enumerate()
+                        .for_each(|(i, p)| inputs.push(filter((i, p))));
+                    let res = inquire::Select::new("Select Midi Output Port", inputs)
+                        .prompt()
+                        .unwrap();
+                    let port = out_port
+                        .iter()
+                        .enumerate()
+                        .find(|(i, p)| filter((*i, p)) == res);
+                    match port {
+                        Some(p) => Some(&out_port[p.0]),
+                        None => None,
+                    }
+                }
+            }
+        };
         let mut img = if let Some(dyn_thumbnail) = &opt_thumbnail
             && let Ok(picker) = picker::Picker::from_query_stdio()
         {
@@ -483,6 +559,7 @@ impl YoutubeRs {
             .await
             .context("Failed to spawn mpv process")
             .expect("Could not spawn MPV");
+        let mpv_vol = mpv.observe_prop::<f64>("volume", 1.0).await;
         if let Some(res) = response {
             mpv.send_command(json!(["loadfile", Self::get_video_url(&res.get_id())]))
                 .await
@@ -501,7 +578,33 @@ impl YoutubeRs {
                 audio_file_error.unwrap_or("No file found".to_string())
             );
         }
-
+        let (midi_volume_tx, midi_volume_rx) = std::sync::mpsc::channel();
+        let (midi_pause_tx, midi_pause_rx) = std::sync::mpsc::channel();
+        let _conn_in = if let Some(in_port) = opt_midi_in_port {
+            midi_in
+                .connect(
+                    in_port,
+                    "midir-read-input",
+                    move |_, message, midi_tx| {
+                        if message[0] == 224 {
+                            let volume_midi = u8_to_mpv_vol(message[2]);
+                            let _ = midi_tx.0.send(volume_midi);
+                        }
+                        if message[1] == 93 || message[1] == 94 {
+                            let _ = midi_tx.1.send(());
+                        }
+                    },
+                    (midi_volume_tx, midi_pause_tx),
+                )
+                .ok()
+        } else {
+            None
+        };
+        let mut conn_out = if let Some(out_port) = opt_midi_out_port {
+            midi_out.connect(out_port, "midir-forward").ok()
+        } else {
+            None
+        };
         let mut term = ratatui::init();
         let time_rx = mpv.observe_prop::<f64>("playback-time", 0.0).await;
         let mut playback_time = 0.0;
@@ -516,6 +619,16 @@ impl YoutubeRs {
 
         // TUI Main Loop
         loop {
+            if let Some(v) = midi_volume_rx.try_iter().last() {
+                // v is from 0 to 130
+                mpv.send_command(json!(["set_property", "volume", v]))
+                    .await
+                    .unwrap();
+            }
+            if let Ok(()) = midi_pause_rx.try_recv() {
+                pause_state = !pause_state;
+                let _ = mpv.set_prop("pause", pause_state).await;
+            }
             if !mpv.running().await {
                 break;
             }
@@ -544,6 +657,7 @@ impl YoutubeRs {
                     f,
                     &mut file,
                     empty_player,
+                    &mpv_vol.borrow(),
                 );
             });
             let event_happened = ratatui::crossterm::event::poll(Duration::from_millis(50)).ok();
@@ -571,6 +685,8 @@ impl YoutubeRs {
                         &mut open_popup,
                         event,
                         empty_player,
+                        &mut conn_out,
+                        &mpv_vol.borrow(),
                     )
                     .await
                 {
@@ -646,7 +762,7 @@ impl YoutubeRs {
                     *response = Some(vid);
                     videos_list.clear();
                 }
-            } else {
+            } else if !popup_query.is_empty() {
                 match self.api {
                     Some(YoutubeAPI::Music) => {
                         let rp = RustyPipe::new();
@@ -706,6 +822,7 @@ impl YoutubeRs {
         f: &mut Frame<'_>,
         file: &mut Option<(TaggedFile, String)>,
         empty_player: bool,
+        mpv_vol: &f64,
     ) {
         if vid_started {
             // General Layout
@@ -749,7 +866,15 @@ impl YoutubeRs {
                     info_layout,
                 );
             } else {
-                self.render_yt_player(response, playback_time, f, info_layout, file, empty_player);
+                self.render_yt_player(
+                    response,
+                    playback_time,
+                    f,
+                    info_layout,
+                    file,
+                    empty_player,
+                    mpv_vol,
+                );
             }
         } else {
             // Vid not started
@@ -801,6 +926,7 @@ impl YoutubeRs {
         f.render_stateful_widget(list, areas[1], selected_list_item);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_yt_player(
         &mut self,
         response: &mut Option<YoutubeResponse>,
@@ -809,6 +935,7 @@ impl YoutubeRs {
         info_layout: Rect,
         file: &mut Option<(TaggedFile, String)>,
         empty_player: bool,
+        mpv_vol: &f64,
     ) {
         // Playback Info When Audio is from Youtube
         if let Some(res) = response {
@@ -821,6 +948,8 @@ impl YoutubeRs {
                     format_time(res.get_duration()),
                 ))
                 .title_alignment(HorizontalAlignment::Center)
+                .title_top(format!("[Vol:{mpv_vol}]"))
+                .title_alignment(HorizontalAlignment::Right)
                 .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek | 'y' Yank URL |'o' YtSearch]")
                 .title_alignment(HorizontalAlignment::Center)
                 .render(info_layout, f.buffer_mut());
@@ -1402,6 +1531,7 @@ impl YoutubeRs {
             .await
             .context("Failed to retrieve Youtube Fetcher")
     }
+    #[allow(clippy::too_many_arguments)]
     async fn handle_playback_event(
         &mut self,
         response: &mut Option<YoutubeResponse>,
@@ -1410,6 +1540,8 @@ impl YoutubeRs {
         open_popup: &mut bool,
         event: ratatui::crossterm::event::Event,
         empty_player: bool,
+        conn_out: &mut Option<MidiOutputConnection>,
+        mpv_vol: &f64,
     ) -> ControlFlow<()> {
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('q') {
             return ControlFlow::Break(());
@@ -1433,9 +1565,15 @@ impl YoutubeRs {
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Up {
             let _ = mpv.send_command(json!(["add", "volume", "5"])).await;
+            if let Some(out_midi_connection) = conn_out {
+                let _ = out_midi_connection.send(&[224, 0, u32_to_midi(*mpv_vol as u32)]);
+            }
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Down {
             let _ = mpv.send_command(json!(["add", "volume", "-5"])).await;
+            if let Some(out_midi_connection) = conn_out {
+                let _ = out_midi_connection.send(&[224, 0, u32_to_midi(*mpv_vol as u32)]);
+            }
         }
         if (response.is_some() | empty_player)
             && event.is_key_press()
@@ -1445,6 +1583,14 @@ impl YoutubeRs {
         }
         ControlFlow::Continue(())
     }
+}
+
+fn u32_to_midi(val: u32) -> u8 {
+    ((val * 127) / 130) as u8
+}
+
+fn u8_to_mpv_vol(val: u8) -> u32 {
+    ((val as u32 * 130) / 127).clamp(0, 130)
 }
 
 impl VideoInfo {

@@ -36,6 +36,8 @@ pub enum AppActionCli {
         url: Option<String>,
         #[clap(short, long, conflicts_with = "file")]
         api: Option<PlayerAPI>,
+        #[clap(short, long)]
+        midi: bool,
     },
     /// Download the transcript using the query
     Transcript {
