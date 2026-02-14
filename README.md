@@ -25,6 +25,11 @@ For more help:
 ytrs -h
 ```
 
+To control the volume and playback using midi
+```
+ytrs player -m
+```
+
 
 You might also want [Ollama](https://ollama.com/) for Summarizing Transcripts.
 
