@@ -59,8 +59,7 @@ async fn main() -> Result<()> {
                 };
                 app = Some(builder.api(is_music, true).url(url.clone()).build(cloned));
             } else {
-                builder.player();
-                app = Some(builder.prompt_player().build(cloned));
+                app = Some(builder.audio_player().build(cloned));
             }
         }
         Some(cli::AppActionCli::Transcript {

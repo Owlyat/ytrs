@@ -48,6 +48,8 @@ pub struct YoutubeRs {
     pub mpv_installed: bool,
     pub last_search: Option<String>,
     pub summarize: Option<bool>,
+    // Enter the player tui directly
+    pub player: bool,
     args: Cli,
 }
 #[derive(Default)]
@@ -58,6 +60,8 @@ pub struct YoutubeRsBuilder {
     summarize: Option<bool>,
     #[allow(dead_code)]
     cli: Cli,
+    // Enter the player tui directly
+    pub player: Option<bool>,
 }
 
 impl YoutubeRs {
@@ -152,6 +156,7 @@ impl YoutubeRsBuilder {
             last_search: Some(self.last_search.clone().unwrap_or_default()),
             args: cli,
             summarize: self.summarize,
+            player: self.player.unwrap_or_default(),
         }
     }
     pub fn api(&mut self, music: Option<bool>, prompt: bool) -> &mut Self {
@@ -221,6 +226,16 @@ impl YoutubeRsBuilder {
             format: FormatInquire::select("Format").prompt().unwrap().into(),
         });
         self.api = Some(YoutubeAPI::select("Select API").prompt().unwrap());
+        self
+    }
+    pub fn audio_player(&mut self) -> &mut Self {
+        self.action = Some(AppAction::Player {
+            format: Format::Audio {
+                format: AudioFormat::MP3,
+            },
+        });
+        self.player = Some(true);
+        self.api = Some(YoutubeAPI::Music);
         self
     }
     pub fn file(&mut self, p: PathBuf) -> &mut Self {
@@ -343,9 +358,13 @@ impl YoutubeRs {
                 }
                 let mut response = match self.api {
                     Some(YoutubeAPI::Music) => {
-                        let res = Self::query_ytmusic(self.last_search.clone()).await?;
-                        self.last_search = Some(res.1);
-                        Some(YoutubeResponse::Track(res.0))
+                        if self.player {
+                            None
+                        } else {
+                            let res = Self::query_ytmusic(self.last_search.clone()).await?;
+                            self.last_search = Some(res.1);
+                            Some(YoutubeResponse::Track(res.0))
+                        }
                     }
                     Some(YoutubeAPI::Video) => {
                         let res = Self::query_ytvideo(self.last_search.clone()).await?;
@@ -407,9 +426,12 @@ impl YoutubeRs {
         } else {
             None
         };
+        let mut empty_player = false;
         let mut audio_file_error = None;
         let mut file: Option<(TaggedFile, String)> = {
-            if let Some(s) = &self.last_search {
+            if let Some(s) = &self.last_search
+                && !s.is_empty()
+            {
                 let f = PathBuf::from(s);
                 if f.exists() && f.is_file() {
                     use lofty::probe::Probe;
@@ -447,11 +469,12 @@ impl YoutubeRs {
                         None
                     }
                 } else {
-                    audio_file_error = Some("File does not exist".to_string());
+                    audio_file_error =
+                        Some(format!("File '{}' does not exist", f.to_string_lossy()));
                     None
                 }
             } else {
-                audio_file_error = Some("No File provided".to_string());
+                empty_player = true;
                 None
             }
         };
@@ -470,6 +493,8 @@ impl YoutubeRs {
                 .await
                 .context("Failed to load media")
                 .expect("Could not send command to MPV");
+        } else if empty_player {
+            // Pass
         } else {
             panic!(
                 "Error : {}",
@@ -518,6 +543,7 @@ impl YoutubeRs {
                     &mut img,
                     f,
                     &mut file,
+                    empty_player,
                 );
             });
             let event_happened = ratatui::crossterm::event::poll(Duration::from_millis(50)).ok();
@@ -544,6 +570,7 @@ impl YoutubeRs {
                         &mut pause_state,
                         &mut open_popup,
                         event,
+                        empty_player,
                     )
                     .await
                 {
@@ -678,6 +705,7 @@ impl YoutubeRs {
         img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
         f: &mut Frame<'_>,
         file: &mut Option<(TaggedFile, String)>,
+        empty_player: bool,
     ) {
         if vid_started {
             // General Layout
@@ -721,7 +749,7 @@ impl YoutubeRs {
                     info_layout,
                 );
             } else {
-                self.render_yt_player(response, playback_time, f, info_layout, file);
+                self.render_yt_player(response, playback_time, f, info_layout, file, empty_player);
             }
         } else {
             // Vid not started
@@ -780,6 +808,7 @@ impl YoutubeRs {
         f: &mut Frame<'_>,
         info_layout: Rect,
         file: &mut Option<(TaggedFile, String)>,
+        empty_player: bool,
     ) {
         // Playback Info When Audio is from Youtube
         if let Some(res) = response {
@@ -831,6 +860,23 @@ impl YoutubeRs {
             Gauge::default()
                 .block(Block::bordered().style(Style::default().yellow().on_blue()))
                 .ratio(playback_time / file.0.properties().duration().as_secs_f64())
+                .render(gauge_layout, f.buffer_mut());
+        } else if empty_player {
+            Block::bordered()
+                .style(Style::default().on_blue().yellow())
+                .title_alignment(HorizontalAlignment::Center)
+                .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek | 'y' Yank URL |'o' YtSearch]")
+                .title_alignment(HorizontalAlignment::Center)
+                .render(info_layout, f.buffer_mut());
+            let gauge_layout = info_layout
+                .inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                })
+                .centered_vertically(Constraint::Percentage(50));
+            Gauge::default()
+                .block(Block::bordered().style(Style::default().yellow().on_blue()))
+                .ratio(playback_time / 1.0)
                 .render(gauge_layout, f.buffer_mut());
         }
     }
@@ -1363,6 +1409,7 @@ impl YoutubeRs {
         pause_state: &mut bool,
         open_popup: &mut bool,
         event: ratatui::crossterm::event::Event,
+        empty_player: bool,
     ) -> ControlFlow<()> {
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('q') {
             return ControlFlow::Break(());
@@ -1390,7 +1437,7 @@ impl YoutubeRs {
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Down {
             let _ = mpv.send_command(json!(["add", "volume", "-5"])).await;
         }
-        if response.is_some()
+        if (response.is_some() | empty_player)
             && event.is_key_press()
             && event.as_key_event().unwrap().code == KeyCode::Char('o')
         {
