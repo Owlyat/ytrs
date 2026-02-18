@@ -1,3 +1,165 @@
+mod midi {
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Copy)]
+    pub enum MidiEvent<'a> {
+        // -------- Channel Voice Messages --------
+        NoteOff {
+            channel: u8,
+            note: u8,
+            velocity: u8,
+        },
+        NoteOn {
+            channel: u8,
+            note: u8,
+            velocity: u8,
+        },
+        PolyAftertouch {
+            channel: u8,
+            note: u8,
+            pressure: u8,
+        },
+        ControlChange {
+            channel: u8,
+            controller: u8,
+            value: u8,
+        },
+        ProgramChange {
+            channel: u8,
+            program: u8,
+        },
+        ChannelAftertouch {
+            channel: u8,
+            pressure: u8,
+        },
+        PitchBend {
+            channel: u8,
+            value: i16,
+        }, // -8192..8191
+
+        // -------- System Common --------
+        TimeCodeQuarterFrame(u8),
+        SongPosition(u16), // 14-bit
+        SongSelect(u8),
+        TuneRequest,
+
+        // -------- System Exclusive --------
+        SysEx(&'a [u8]),
+
+        // -------- System Real-Time --------
+        TimingClock,
+        Start,
+        Continue,
+        Stop,
+        ActiveSensing,
+        Reset,
+
+        Unknown,
+    }
+    pub fn parse_midi<'a>(message: &'a [u8]) -> MidiEvent<'a> {
+        if message.is_empty() {
+            return MidiEvent::Unknown;
+        }
+
+        let status = message[0];
+
+        // -------- System Real-Time (single byte, can appear anytime) --------
+        match status {
+            0xF8 => return MidiEvent::TimingClock,
+            0xFA => return MidiEvent::Start,
+            0xFB => return MidiEvent::Continue,
+            0xFC => return MidiEvent::Stop,
+            0xFE => return MidiEvent::ActiveSensing,
+            0xFF => return MidiEvent::Reset,
+            _ => {}
+        }
+
+        // -------- System Exclusive --------
+        if status == 0xF0 {
+            return MidiEvent::SysEx(message);
+        }
+
+        // -------- System Common --------
+        match status {
+            0xF1 if message.len() >= 2 => return MidiEvent::TimeCodeQuarterFrame(message[1]),
+
+            0xF2 if message.len() >= 3 => {
+                let value = ((message[2] as u16) << 7) | message[1] as u16;
+                return MidiEvent::SongPosition(value);
+            }
+
+            0xF3 if message.len() >= 2 => return MidiEvent::SongSelect(message[1]),
+
+            0xF6 => return MidiEvent::TuneRequest,
+
+            _ => {}
+        }
+
+        // -------- Channel Voice Messages --------
+        if message.len() < 2 {
+            return MidiEvent::Unknown;
+        }
+
+        let message_type = status & 0xF0;
+        let channel = status & 0x0F;
+
+        match message_type {
+            0x80 if message.len() >= 3 => MidiEvent::NoteOff {
+                channel,
+                note: message[1],
+                velocity: message[2],
+            },
+
+            0x90 if message.len() >= 3 => {
+                let velocity = message[2];
+                if velocity == 0 {
+                    MidiEvent::NoteOff {
+                        channel,
+                        note: message[1],
+                        velocity: 0,
+                    }
+                } else {
+                    MidiEvent::NoteOn {
+                        channel,
+                        note: message[1],
+                        velocity,
+                    }
+                }
+            }
+
+            0xA0 if message.len() >= 3 => MidiEvent::PolyAftertouch {
+                channel,
+                note: message[1],
+                pressure: message[2],
+            },
+
+            0xB0 if message.len() >= 3 => MidiEvent::ControlChange {
+                channel,
+                controller: message[1],
+                value: message[2],
+            },
+
+            0xC0 => MidiEvent::ProgramChange {
+                channel,
+                program: message[1],
+            },
+
+            0xD0 => MidiEvent::ChannelAftertouch {
+                channel,
+                pressure: message[1],
+            },
+
+            0xE0 if message.len() >= 3 => {
+                let value = ((message[2] as i16) << 7) | message[1] as i16;
+                MidiEvent::PitchBend {
+                    channel,
+                    value: value - 8192,
+                }
+            }
+
+            _ => MidiEvent::Unknown,
+        }
+    }
+}
 use crate::cli::{AppActionCli, Cli};
 use crate::mpv::{MpvIpc, MpvSpawnOptions};
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,10 +197,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 use strum::IntoEnumIterator;
 use thiserror::Error;
-use yt_dlp::Youtube;
 use yt_dlp::client::Libraries;
-use yt_dlp::model::VideoCodecPreference;
 use yt_dlp::model::caption::Subtitle;
+use yt_dlp::model::{Video, VideoCodecPreference};
+use yt_dlp::{Downloader, install_libraries};
 
 use crate::utility::format_time;
 
@@ -329,14 +491,13 @@ impl YoutubeRs {
                     }
                     None => return Ok(()),
                 };
-                let url = format!("https://www.youtube.com/watch?v={video_id}");
                 match format {
                     Format::Audio { format } => {
-                        self.download_audio(&url, &video_name, format, &self.args)
+                        self.download_audio(video_id, &video_name, format, &self.args)
                             .await?;
                     }
                     Format::Video { format } => {
-                        self.download_video(&url, &video_name, format, &self.args)
+                        self.download_video(&video_id, &video_name, format, &self.args)
                             .await?;
                     }
                 }
@@ -586,12 +747,21 @@ impl YoutubeRs {
                     in_port,
                     "midir-read-input",
                     move |_, message, midi_tx| {
-                        if message[0] == 224 {
-                            let volume_midi = u8_to_mpv_vol(message[2]);
-                            let _ = midi_tx.0.send(volume_midi);
-                        }
-                        if message[1] == 93 || message[1] == 94 {
-                            let _ = midi_tx.1.send(());
+                        let midi_event = midi::parse_midi(message);
+                        match midi_event {
+                            midi::MidiEvent::NoteOn {
+                                channel: _,
+                                note,
+                                velocity: _,
+                            } => {
+                                if matches!(note, 93 | 94) {
+                                    let _ = midi_tx.1.send(());
+                                }
+                            }
+                            midi::MidiEvent::PitchBend { channel: _, value } => {
+                                let _ = midi_tx.0.send(pitch_bend_to_mpv_vol(value));
+                            }
+                            _ => {}
                         }
                     },
                     (midi_volume_tx, midi_pause_tx),
@@ -1015,8 +1185,8 @@ impl YoutubeRs {
             .map_err(|e| anyhow::anyhow!("Clipboard error: {:?}", e))?;
         Ok(())
     }
-    fn get_video_url(video_id: &String) -> String {
-        format!("https://www.youtube.com/watch?v={video_id}")
+    fn get_video_url(video_id: impl Into<String>) -> String {
+        format!("https://www.youtube.com/watch?v={}", video_id.into())
     }
     fn cleanup_rustypipe_cache() {
         std::fs::remove_file("./rustypipe_cache.json").expect("Could not clean cache");
@@ -1024,11 +1194,11 @@ impl YoutubeRs {
 
     async fn fetch_yt_thumbnail(video_id: &str, args: &Cli) -> Result<DynamicImage> {
         let thumbnail_url = if Self::ytdlp_exist(args) {
-            Self::get_fetcher(args)
-                .await?
-                .fetch_video_infos(String::from(video_id))
-                .await?
+            Self::fetch_video_info(args, video_id)
+                .await
+                .expect("Could not get fetcher")
                 .thumbnail
+                .unwrap()
         } else {
             format!("https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
         };
@@ -1043,19 +1213,21 @@ impl YoutubeRs {
 
     async fn download_audio(
         &self,
-        url: &str,
+        video_id: impl std::fmt::Display,
         video_name: &str,
         format: AudioFormat,
         args: &Cli,
     ) -> Result<()> {
         println!("Downloading Audio ...");
-        let fetcher = Self::get_fetcher(args).await?;
         let safe_name =
             video_name.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
-        let vid_info = fetcher.fetch_video_infos(url.to_string()).await?;
+        let vid_info = Self::fetch_video_info(args, video_id.to_string().as_str())
+            .await
+            .unwrap();
+        let fetcher = Self::get_downloader(args).await?;
         let downloaded = fetcher
             .download_audio_stream_with_quality(
-                url.to_string(),
+                Self::get_video_url(video_id.to_string()),
                 format!("{safe_name}.{}", format.to_string().to_lowercase()),
                 yt_dlp::model::AudioQuality::Best,
                 yt_dlp::model::AudioCodecPreference::Custom(format.to_string()),
@@ -1078,10 +1250,10 @@ impl YoutubeRs {
             }
         };
         tag.set_title(vid_info.title);
-        tag.set_artist(vid_info.channel);
+        tag.set_artist(vid_info.channel.unwrap());
         tag.set_genre(vid_info.tags.iter().cloned().collect());
         let thumbnail = reqwest::Client::new()
-            .get(vid_info.thumbnail)
+            .get(vid_info.thumbnail.unwrap())
             .send()
             .await?
             .bytes()
@@ -1099,18 +1271,18 @@ impl YoutubeRs {
 
     async fn download_video(
         &self,
-        url: &str,
+        video_id: impl std::fmt::Display,
         video_name: &str,
         format: VideoFormat,
         args: &Cli,
     ) -> Result<()> {
         println!("Downloading Video ...");
-        let fetcher = Self::get_fetcher(args).await?;
+        let fetcher = Self::get_downloader(args).await?;
         let safe_name =
             video_name.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
         let downloaded = fetcher
             .download_video_with_quality(
-                url.to_string(),
+                Self::get_video_url(video_id.to_string()),
                 format!("{safe_name}.{}", format.to_string().to_lowercase()),
                 yt_dlp::model::VideoQuality::Best,
                 VideoCodecPreference::Custom(format.to_string()),
@@ -1123,7 +1295,7 @@ impl YoutubeRs {
     }
 
     async fn download_transcript(&self, video_id: &str, args: &Cli) -> Result<()> {
-        let fetcher = Self::get_fetcher(args).await?;
+        let fetcher = Self::get_downloader(args).await?;
 
         let url = format!("https://www.youtube.com/watch?v={video_id}");
         let video = fetcher.fetch_video_infos(url).await?;
@@ -1138,8 +1310,8 @@ impl YoutubeRs {
                 .collect();
             if cap.is_empty() {
                 println!("No Generated Caption found");
-                if !video.description.is_empty() {
-                    println!("{}: \n{}", "Video Description".green(), video.description);
+                if let Some(desc) = video.description {
+                    println!("{}: \n{}", "Video Description".green(), desc);
                 }
                 return Ok(());
             }
@@ -1419,8 +1591,8 @@ impl YoutubeRs {
 
     async fn install_lib(args: &Cli) -> Result<()> {
         println!("Installing Libraries");
-        let (exec_dir, output_dir) = Self::get_libs_path(args);
-        let _ = Youtube::with_new_binaries(exec_dir, output_dir).await?;
+        let (exec_dir, _) = Self::get_libs_path(args);
+        install_libraries!(exec_dir)?;
         Ok(())
     }
     #[cfg(target_os = "windows")]
@@ -1524,12 +1696,22 @@ impl YoutubeRs {
         let ffmpeg = libs.join("ffmpeg");
         Libraries::new(youtube, ffmpeg)
     }
-    async fn get_fetcher(args: &Cli) -> Result<Youtube> {
+    async fn get_downloader(args: &Cli) -> Result<Downloader> {
         let (_, out) = Self::get_libs_path(args);
         let libs = Self::get_libs(args);
-        Youtube::new(libs, out)
+        Downloader::new(libs, out)
             .await
             .context("Failed to retrieve Youtube Fetcher")
+    }
+    async fn fetch_video_info(args: &Cli, video_id: &str) -> Option<Video> {
+        let (libs, out) = Self::get_libs_path(args);
+        let libraries = Libraries::new(libs.join("yt-dlp"), libs.join("ffmpeg"));
+        if let Ok(x) = yt_dlp::Downloader::new(libraries, out).await {
+            if let Ok(x) = x.fetch_video_infos(Self::get_video_url(video_id)).await {
+                return Some(x);
+            }
+        }
+        None
     }
     #[allow(clippy::too_many_arguments)]
     async fn handle_playback_event(
@@ -1589,8 +1771,11 @@ fn u32_to_midi(val: u32) -> u8 {
     ((val * 127) / 130) as u8
 }
 
-fn u8_to_mpv_vol(val: u8) -> u32 {
-    ((val as u32 * 130) / 127).clamp(0, 130)
+fn pitch_bend_to_mpv_vol(bend: i16) -> u8 {
+    let bend = bend.clamp(-8192, 8191);
+    let normalized = bend as i32 + 8192;
+    let vol = ((normalized * 130) + 8191) / 16383;
+    vol as u8
 }
 
 impl VideoInfo {
