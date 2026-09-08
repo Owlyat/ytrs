@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::{process, time};
 use tokio_util::sync::CancellationToken;
+use tracing::{info, debug, warn, error, trace};
 
 fn unix_timestamp() -> u64 {
     SystemTime::now()
@@ -79,6 +80,7 @@ pub struct MpvSpawnOptions {
     pub ipc_path: Option<PathBuf>,
     pub config_dir: Option<PathBuf>,
     pub inherit_stdout: bool,
+    pub vo: Option<String>,
 }
 
 pub struct MpvIpc {
@@ -96,18 +98,22 @@ pub struct MpvIpc {
 impl MpvIpc {
     /// Attach to an existing mpv IPC socket.
     pub async fn connect(ipc_path: &PathBuf) -> anyhow::Result<Self> {
+        debug!(?ipc_path, "mpv: connecting to IPC socket");
         // Retry before giving up
         let (mut line_reader, writer): (Lines<_>, WriteHalf<_>) = async {
             for n in 0..10 {
                 if n > 0 {
+                    debug!(attempt = n, "mpv: retrying connection");
                     time::sleep(Duration::from_millis(100) * n).await;
                 }
                 if let Ok(stream) = mpv_platform::connect(ipc_path).await {
                     let (reader, writer) = io::split(stream);
                     let line_reader = BufReader::new(reader).lines();
+                    debug!("mpv: connected to IPC socket");
                     return Ok((line_reader, writer));
                 }
             }
+            error!("mpv: failed to connect after 10 retries");
             bail!("failed to connect to mpv socket");
         }
         .await?;
@@ -130,6 +136,7 @@ impl MpvIpc {
         let observers_ref = observers.clone();
         let event_handlers_ref = event_handlers.clone();
         let mpv_ipc_task = tokio::spawn(async move {
+            debug!("mpv: IPC reader task started");
             loop {
                 let res = tokio::select! {
                     line = line_reader.next_line() => { line },
@@ -138,6 +145,7 @@ impl MpvIpc {
                     }
                 };
                 let Ok(Some(str)) = res else {
+                    warn!("mpv: IPC connection lost (no more lines)");
                     shutdown_ref.cancel();
                     // TODO: this should also abort tasks etc
 
@@ -165,6 +173,7 @@ impl MpvIpc {
                     .and_then(|j| j.get("event"))
                     .and_then(|j| j.as_str())
                 {
+                    trace!(event, "mpv: received event");
                     if let Some(list) = event_handlers_ref.lock().await.get(event) {
                         for handler in list {
                             handler.send(json.clone()).await.unwrap();
@@ -222,10 +231,17 @@ impl MpvIpc {
         ];
         if audio_only {
             args.push("--no-video".to_string());
+        } else if let Some(vo) = &opt.vo {
+            args.push(format!("--vo={vo}"));
         }
         if let Some(config_dir) = &opt.config_dir {
             args.push("--config-dir=".to_owned() + &config_dir.to_string_lossy());
         }
+        // mpv's own log (vo errors, track info): stderr is nulled, so this
+        // file is the only witness of the mpv side. Overwritten per spawn.
+        let mpv_log = std::env::temp_dir().join("ytrs-mpv.log");
+        args.push("--log-file=".to_owned() + &mpv_log.to_string_lossy());
+        debug!(?mpv_path, ?ipc_path, ?args, ?mpv_log, audio_only, "mpv: spawning process");
         let stdout_mode = || {
             if opt.inherit_stdout {
                 Stdio::inherit()
@@ -241,14 +257,17 @@ impl MpvIpc {
             .spawn()
             .context("Failed to spawn mpv process")?;
         let child_pid = child.id().unwrap();
+        debug!(child_pid, "mpv: process spawned");
 
         // Connect
         let mut sself = Self::connect(&ipc_path).await?;
         sself.child = Some(child);
 
         // Sanity check
+        debug!("mpv: running sanity check (get pid)");
         let ipc_pid = sself.get_prop::<u32>("pid").await?;
         let _ = ipc_pid != child_pid;
+        debug!(ipc_pid, child_pid, "mpv: sanity check done");
 
         Ok(sself)
     }
@@ -264,6 +283,7 @@ impl MpvIpc {
         cmd: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         if self.shutdown.is_cancelled() {
+            warn!("send_command: mpv already shut down");
             bail!("mpv instance has shut down");
         }
         let (tx, rx) = oneshot::channel::<anyhow::Result<serde_json::Value>>();
@@ -271,13 +291,24 @@ impl MpvIpc {
         self.requests.lock().await.insert(self.request_id, tx);
         let str = serde_json::to_string(&MpvCommand {
             request_id: self.request_id,
-            command: cmd,
+            command: cmd.clone(),
         })
         .unwrap();
+        trace!(req_id = self.request_id, ?cmd, "send_command: sending");
         self.writer.write_all((str + "\n").as_bytes()).await?;
         tokio::select! {
-            result = rx => result?,
-            _ = self.shutdown.cancelled() => bail!("mpv shutdown"),
+            result = rx => {
+                match &result {
+                    Ok(Ok(_val)) => trace!(req_id = self.request_id, "send_command: success"),
+                    Ok(Err(e)) => warn!(req_id = self.request_id, ?e, "send_command: error response"),
+                    Err(e) => error!(req_id = self.request_id, ?e, "send_command: channel error"),
+                }
+                result?
+            }
+            _ = self.shutdown.cancelled() => {
+                warn!(req_id = self.request_id, "send_command: mpv shutdown during wait");
+                bail!("mpv shutdown")
+            }
         }
     }
 
@@ -290,6 +321,7 @@ impl MpvIpc {
 
     /// Shuts down the mpv player and disconnects.
     pub async fn quit(&mut self) {
+        info!("mpv: quitting");
         self.abort_tasks();
         let quit_fut = self
             .writer
@@ -300,6 +332,7 @@ impl MpvIpc {
             _ = child.kill();
         }
         self.shutdown.cancel();
+        info!("mpv: quit complete");
     }
 
     /// Disconnect from the IPC socket.
@@ -318,6 +351,7 @@ impl MpvIpc {
     }
 
     pub async fn set_prop(&mut self, name: &str, value: impl Serialize) -> anyhow::Result<()> {
+        trace!(?name, "set_prop");
         self.send_command(json!(["set_property", name, value]))
             .await
             .map(|_| ())
@@ -328,6 +362,7 @@ impl MpvIpc {
         name: impl AsRef<str> + 'static + Send + Sync + Serialize + Display,
         default: T,
     ) -> watch::Receiver<T> {
+        debug!(name = %name, "observe_prop: creating observer");
         // Create observer
         self.request_id += 1;
         let id = self.request_id;
@@ -342,6 +377,7 @@ impl MpvIpc {
             .get_prop(name.as_ref())
             .await
             .unwrap_or_else(|_| default.clone());
+        debug!(name = %name, "observe_prop: initial value obtained");
         let (t_tx, t_rx) = watch::channel::<T>(init_val);
         self.tasks.push(tokio::spawn(async move {
             loop {

@@ -1,190 +1,23 @@
-mod midi {
-    #[allow(dead_code)]
-    #[derive(Debug, Clone, Copy)]
-    pub enum MidiEvent<'a> {
-        // -------- Channel Voice Messages --------
-        NoteOff {
-            channel: u8,
-            note: u8,
-            velocity: u8,
-        },
-        NoteOn {
-            channel: u8,
-            note: u8,
-            velocity: u8,
-        },
-        PolyAftertouch {
-            channel: u8,
-            note: u8,
-            pressure: u8,
-        },
-        ControlChange {
-            channel: u8,
-            controller: u8,
-            value: u8,
-        },
-        ProgramChange {
-            channel: u8,
-            program: u8,
-        },
-        ChannelAftertouch {
-            channel: u8,
-            pressure: u8,
-        },
-        PitchBend {
-            channel: u8,
-            value: i16,
-        }, // -8192..8191
-
-        // -------- System Common --------
-        TimeCodeQuarterFrame(u8),
-        SongPosition(u16), // 14-bit
-        SongSelect(u8),
-        TuneRequest,
-
-        // -------- System Exclusive --------
-        SysEx(&'a [u8]),
-
-        // -------- System Real-Time --------
-        TimingClock,
-        Start,
-        Continue,
-        Stop,
-        ActiveSensing,
-        Reset,
-
-        Unknown,
-    }
-    pub fn parse_midi<'a>(message: &'a [u8]) -> MidiEvent<'a> {
-        if message.is_empty() {
-            return MidiEvent::Unknown;
-        }
-
-        let status = message[0];
-
-        // -------- System Real-Time (single byte, can appear anytime) --------
-        match status {
-            0xF8 => return MidiEvent::TimingClock,
-            0xFA => return MidiEvent::Start,
-            0xFB => return MidiEvent::Continue,
-            0xFC => return MidiEvent::Stop,
-            0xFE => return MidiEvent::ActiveSensing,
-            0xFF => return MidiEvent::Reset,
-            _ => {}
-        }
-
-        // -------- System Exclusive --------
-        if status == 0xF0 {
-            return MidiEvent::SysEx(message);
-        }
-
-        // -------- System Common --------
-        match status {
-            0xF1 if message.len() >= 2 => return MidiEvent::TimeCodeQuarterFrame(message[1]),
-
-            0xF2 if message.len() >= 3 => {
-                let value = ((message[2] as u16) << 7) | message[1] as u16;
-                return MidiEvent::SongPosition(value);
-            }
-
-            0xF3 if message.len() >= 2 => return MidiEvent::SongSelect(message[1]),
-
-            0xF6 => return MidiEvent::TuneRequest,
-
-            _ => {}
-        }
-
-        // -------- Channel Voice Messages --------
-        if message.len() < 2 {
-            return MidiEvent::Unknown;
-        }
-
-        let message_type = status & 0xF0;
-        let channel = status & 0x0F;
-
-        match message_type {
-            0x80 if message.len() >= 3 => MidiEvent::NoteOff {
-                channel,
-                note: message[1],
-                velocity: message[2],
-            },
-
-            0x90 if message.len() >= 3 => {
-                let velocity = message[2];
-                if velocity == 0 {
-                    MidiEvent::NoteOff {
-                        channel,
-                        note: message[1],
-                        velocity: 0,
-                    }
-                } else {
-                    MidiEvent::NoteOn {
-                        channel,
-                        note: message[1],
-                        velocity,
-                    }
-                }
-            }
-
-            0xA0 if message.len() >= 3 => MidiEvent::PolyAftertouch {
-                channel,
-                note: message[1],
-                pressure: message[2],
-            },
-
-            0xB0 if message.len() >= 3 => MidiEvent::ControlChange {
-                channel,
-                controller: message[1],
-                value: message[2],
-            },
-
-            0xC0 => MidiEvent::ProgramChange {
-                channel,
-                program: message[1],
-            },
-
-            0xD0 => MidiEvent::ChannelAftertouch {
-                channel,
-                pressure: message[1],
-            },
-
-            0xE0 if message.len() >= 3 => {
-                let value = ((message[2] as i16) << 7) | message[1] as i16;
-                MidiEvent::PitchBend {
-                    channel,
-                    value: value - 8192,
-                }
-            }
-
-            _ => MidiEvent::Unknown,
-        }
-    }
-}
-use crate::cli::{AppActionCli, Cli};
+mod midi;
+use crate::cli::{Cli, ImgProtocol};
 use crate::mpv::{MpvIpc, MpvSpawnOptions};
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Timelike, Utc};
 use image::DynamicImage;
-use inquire::{Confirm, Select, Text as InquireText, validator::Validation};
-use inquire_derive::Selectable;
 use lofty::config::WriteOptions;
-use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
+use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::picture::Picture;
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, Tag, TagExt};
-use midir::{MidiInput, MidiInputPort, MidiOutput, MidiOutputConnection, MidiOutputPort};
+use midir::{
+    MidiInput, MidiInputConnection, MidiInputPort, MidiOutput, MidiOutputConnection, MidiOutputPort,
+};
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ratatui::crossterm::event::KeyModifiers;
-use ratatui::prelude::*;
 use ratatui::style::Stylize;
-use ratatui::widgets::{Gauge, List, ListItem, ListState};
-use ratatui::{
-    crossterm::event::{KeyCode, read},
-    layout::{Constraint, Layout},
-    widgets::{Block, Paragraph},
-};
-use ratatui_image::{StatefulImage, picker};
+use ratatui::widgets::ListState;
+use ratatui::crossterm::event::{KeyCode, read};
+use ratatui_image::picker;
 use rustypipe::{
     client::RustyPipe,
     model::{TrackItem, VideoItem},
@@ -193,15 +26,20 @@ use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use strum::IntoEnumIterator;
 use thiserror::Error;
+use tracing::{debug, error, info, warn};
 use yt_dlp::client::Libraries;
 use yt_dlp::model::caption::Subtitle;
 use yt_dlp::model::{Video, VideoCodecPreference};
 use yt_dlp::{Downloader, install_libraries};
 
+use crate::config::Theme;
+use crate::playlist::{Playlist, PlaylistItem};
+use crate::sidebar::Sidebar;
+use crate::ui;
 use crate::utility::format_time;
 
 #[derive(Default)]
@@ -214,6 +52,11 @@ pub struct YoutubeRs {
     // Enter the player tui directly
     pub player: bool,
     pub run_midi: bool,
+    pub embed: bool,
+    pub vo: Option<String>,
+    pub audio_device: Option<String>,
+    pub no_art: bool,
+    pub img_protocol: ImgProtocol,
     args: Cli,
 }
 #[derive(Default)]
@@ -227,6 +70,11 @@ pub struct YoutubeRsBuilder {
     // Enter the player tui directly
     pub player: Option<bool>,
     midi: bool,
+    embed: bool,
+    vo: Option<String>,
+    audio_device: Option<String>,
+    no_art: bool,
+    img_protocol: ImgProtocol,
 }
 
 impl YoutubeRs {
@@ -235,7 +83,41 @@ impl YoutubeRs {
     }
 }
 
-#[derive(strum::Display, strum::EnumIter, Clone, Copy, Default)]
+/// Detect a music source URL. `None` when the domain is unknown.
+pub fn url_is_music(url: &str) -> Option<bool> {
+    let lower = url.to_lowercase();
+    if lower.starts_with("https://music.youtube.com") {
+        Some(true)
+    } else if lower.starts_with("https://www.youtube.com")
+        || lower.starts_with("https://youtu.be")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Extract a YouTube video id from watch / youtu.be / shorts / music URLs.
+pub fn extract_video_id(url: &str) -> Option<String> {
+    // watch?v=ID Parsons
+    if let Some(v_pos) = url.find("v=") {
+        let id: String = url[v_pos + 2..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if id.len() == 11 {
+            return Some(id);
+        }
+    }
+    // youtu.be/ID, /shorts/ID, /embed/ID, /live/ID
+    let last = url.split(['?', '#']).next()?.rsplit('/').next()?;
+    if last.len() == 11 && last.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return Some(last.to_string());
+    }
+    None
+}
+
+#[derive(strum::Display, strum::EnumIter, Clone, Copy, Default, Debug)]
 pub enum AppAction {
     Download {
         format: Format,
@@ -244,30 +126,25 @@ pub enum AppAction {
     Player {
         format: Format,
     },
+    Update,
     #[default]
     Quit,
 }
 
-#[derive(strum::Display, strum::EnumIter, Default, Clone, Selectable, Debug, Copy)]
+#[derive(strum::Display, strum::EnumIter, Default, Clone, Debug, Copy)]
 pub enum YoutubeAPI {
     Music,
     #[default]
     Video,
 }
-#[derive(Copy, Debug, Selectable, strum::Display, Clone)]
-pub enum FormatInquire {
-    Audio,
-    Video,
-}
-
-#[derive(strum::Display, strum::EnumIter, Clone, PartialEq, Copy)]
+#[derive(strum::Display, strum::EnumIter, Clone, PartialEq, Copy, Debug)]
 pub enum Format {
     Audio { format: AudioFormat },
     Video { format: VideoFormat },
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq, Copy, Debug, Selectable)]
+#[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq, Copy, Debug)]
 pub enum AudioFormat {
     #[default]
     MP3,
@@ -275,7 +152,7 @@ pub enum AudioFormat {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq, Copy, Selectable, Debug)]
+#[derive(Clone, strum::Display, strum::EnumIter, Default, PartialEq, Copy, Debug)]
 pub enum VideoFormat {
     #[default]
     MP4,
@@ -312,9 +189,102 @@ pub enum YtrsError {
     Quit,
 }
 
+/// Options applied at TUI launch, in order: TUI, MPV, audio output, MIDI.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchOptions {
+    pub audio_only: bool,
+    pub vo: Option<String>,
+    pub embed: bool,
+    pub audio_device: Option<String>,
+    pub midi: bool,
+    pub no_art: bool,
+    pub img_protocol: ImgProtocol,
+}
+
+type MidiConnIn = MidiInputConnection<(std::sync::mpsc::Sender<u8>, std::sync::mpsc::Sender<()>)>;
+
+/// Live MIDI connections + channels. Ports are (re)connected on demand,
+/// either at launch (first port) or from the setup menu.
+struct MidiRuntime {
+    conn_in: Option<MidiConnIn>,
+    conn_out: Option<MidiOutputConnection>,
+    volume_rx: std::sync::mpsc::Receiver<u8>,
+    pause_rx: std::sync::mpsc::Receiver<()>,
+}
+
+impl MidiRuntime {
+    fn new() -> Self {
+        let (_, volume_rx) = std::sync::mpsc::channel();
+        let (_, pause_rx) = std::sync::mpsc::channel();
+        Self {
+            conn_in: None,
+            conn_out: None,
+            volume_rx,
+            pause_rx,
+        }
+    }
+
+    fn connect_input(&mut self, port: Option<MidiInputPort>) {
+        self.conn_in = None;
+        if let Some(port) = port {
+            match MidiInput::new("ytrs-midi-in") {
+                Ok(mut midi_in) => {
+                    midi_in.ignore(midir::Ignore::None);
+                    let (volume_tx, volume_rx) = std::sync::mpsc::channel();
+                    let (pause_tx, pause_rx) = std::sync::mpsc::channel();
+                    self.conn_in = listen_midi_input(midi_in, Some(port), volume_tx, pause_tx);
+                    if self.conn_in.is_some() {
+                        self.volume_rx = volume_rx;
+                        self.pause_rx = pause_rx;
+                    }
+                }
+                Err(e) => warn!(?e, "midi: input init failed"),
+            }
+        }
+    }
+
+    fn connect_output(&mut self, port: Option<MidiOutputPort>) {
+        self.conn_out = None;
+        if let Some(port) = port {
+            match MidiOutput::new("ytrs-midi-out") {
+                Ok(midi_out) => {
+                    self.conn_out = midi_out.connect(&port, "midir-forward").ok();
+                }
+                Err(e) => warn!(?e, "midi: output init failed"),
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+struct AudioDevice {
+    name: String,
+    description: Option<String>,
+}
+
+/// Background YouTube search: resolved results or a displayable error.
+type SearchTask =
+    tokio::task::JoinHandle<Result<Vec<(String, YoutubeResponse)>, String>>;
+
+/// Outcome of a setup-menu event: keep going or respawn mpv with a new
+/// audio-only/video mode.
+enum SetupOutcome {
+    Continue,
+    Respawn { audio_only: bool },
+}
+
+impl AudioDevice {
+    fn display(&self) -> String {
+        match &self.description {
+            Some(d) => format!("{} — {d}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
 impl YoutubeRsBuilder {
     pub fn build(&mut self, cli: Cli) -> YoutubeRs {
-        YoutubeRs {
+        let yt = YoutubeRs {
             api: self.api,
             action: self.action.unwrap_or_default(),
             mpv_installed: YoutubeRs::check_mpv().unwrap_or_default(),
@@ -323,18 +293,34 @@ impl YoutubeRsBuilder {
             summarize: self.summarize,
             player: self.player.unwrap_or_default(),
             run_midi: self.midi,
-        }
+            embed: self.embed,
+            vo: self.vo.clone(),
+            audio_device: self.audio_device.clone(),
+            no_art: self.no_art,
+            img_protocol: self.img_protocol,
+        };
+        debug!(
+            api = ?yt.api,
+            action = %yt.action,
+            mpv_installed = yt.mpv_installed,
+            last_search = ?yt.last_search,
+            player = yt.player,
+            midi = yt.run_midi,
+            "builder produced YoutubeRs"
+        );
+        yt
     }
-    pub fn api(&mut self, music: Option<bool>, prompt: bool) -> &mut Self {
-        if let Some(is_music) = music {
-            if is_music {
-                self.api = Some(YoutubeAPI::Music)
-            } else {
-                self.api = Some(YoutubeAPI::Video)
+    pub fn api(&mut self, music: Option<bool>) -> &mut Self {
+        self.api = Some(match music {
+            Some(true) => {
+                debug!("api: setting Music");
+                YoutubeAPI::Music
             }
-        } else if prompt {
-            self.api = Some(YoutubeAPI::select("Select API").prompt().unwrap());
-        }
+            _ => {
+                debug!("api: setting Video (default)");
+                YoutubeAPI::Video
+            }
+        });
 
         self
     }
@@ -342,20 +328,24 @@ impl YoutubeRsBuilder {
         self.midi = run_midi;
         self
     }
-    pub fn action(&mut self, action: Option<AppAction>, cli: Option<AppActionCli>) -> &mut Self {
-        if let Some(action) = cli {
-            self.action = Some(match action {
-                AppActionCli::Download { .. } => AppAction::Download {
-                    format: Default::default(),
-                },
-                AppActionCli::Player { .. } => AppAction::Player {
-                    format: Default::default(),
-                },
-                AppActionCli::Transcript { .. } => AppAction::Transcript,
-            });
-        } else if let Some(action) = action {
-            self.action = Some(action);
-        }
+    pub fn embed(&mut self, embed: bool) -> &mut Self {
+        self.embed = embed;
+        self
+    }
+    pub fn vo(&mut self, vo: Option<String>) -> &mut Self {
+        self.vo = vo;
+        self
+    }
+    pub fn audio_device(&mut self, device: Option<String>) -> &mut Self {
+        self.audio_device = device;
+        self
+    }
+    pub fn no_art(&mut self, no_art: bool) -> &mut Self {
+        self.no_art = no_art;
+        self
+    }
+    pub fn img_protocol(&mut self, protocol: ImgProtocol) -> &mut Self {
+        self.img_protocol = protocol;
         self
     }
     pub fn transcript(&mut self) -> &mut Self {
@@ -363,26 +353,8 @@ impl YoutubeRsBuilder {
         self.api = Some(YoutubeAPI::Video);
         self
     }
-    pub fn prompt_download(&mut self) -> &mut Self {
-        self.action = Some(AppAction::Download {
-            format: FormatInquire::select("Select Format")
-                .prompt()
-                .unwrap()
-                .into(),
-        });
-        self
-    }
-    pub fn prompt_format(&mut self) -> &mut Self {
-        if let Some(AppAction::Download { format }) = &mut self.action {
-            match format {
-                Format::Audio { format } => {
-                    *format = AudioFormat::select("Select Audio Format").prompt().unwrap()
-                }
-                Format::Video { format } => {
-                    *format = VideoFormat::select("Select Video Format").prompt().unwrap()
-                }
-            }
-        }
+    pub fn download(&mut self, format: Format) -> &mut Self {
+        self.action = Some(AppAction::Download { format });
         self
     }
     pub fn player(&mut self) -> &mut Self {
@@ -391,11 +363,8 @@ impl YoutubeRsBuilder {
         });
         self
     }
-    pub fn prompt_player(&mut self) -> &mut Self {
-        self.action = Some(AppAction::Player {
-            format: FormatInquire::select("Format").prompt().unwrap().into(),
-        });
-        self.api = Some(YoutubeAPI::select("Select API").prompt().unwrap());
+    pub fn player_with_format(&mut self, format: Format) -> &mut Self {
+        self.action = Some(AppAction::Player { format });
         self
     }
     pub fn audio_player(&mut self) -> &mut Self {
@@ -430,12 +399,12 @@ impl YoutubeRsBuilder {
     }
     pub fn url(&mut self, url: impl Into<String>) -> &mut Self {
         let url: String = url.into();
-        if url.to_lowercase().starts_with("https://music.youtube.com") {
-            self.api = Some(YoutubeAPI::Music);
-        } else if url.to_lowercase().starts_with("https://www.youtube.com") {
-            self.api = Some(YoutubeAPI::Video);
-        } else {
-            self.api = Some(YoutubeAPI::select("Select API").prompt().unwrap());
+        self.api = Some(match url_is_music(&url) {
+            Some(true) => YoutubeAPI::Music,
+            _ => YoutubeAPI::Video,
+        });
+        if url_is_music(&url).is_none() {
+            debug!("url: unknown domain, defaulting to Video API");
         }
         self.last_search = Some(url);
         self
@@ -472,330 +441,317 @@ impl YoutubeResponse {
 }
 
 impl YoutubeRs {
-    pub async fn process(&mut self) -> Result<()> {
+    /// App entry point (called as `app.run()` from `main`):
+    /// terminal flows for download/transcript, TUI hub for the player.
+    pub async fn run(&mut self) -> Result<()> {
+        info!(action = %self.action, api = ?self.api, "run: starting");
         match self.action {
             AppAction::Download { format } => {
-                if !self.libraries_exist(&self.args.clone()) {
+                info!(?format, "run: download action");
+                if !Self::libraries_exist(&self.args.clone()) {
                     Self::install_lib(&self.args).await?;
                 }
-                let (video_id, video_name) = match self.api {
-                    Some(YoutubeAPI::Music) => {
-                        let (track, search) = Self::query_ytmusic(self.last_search.clone()).await?;
-                        self.last_search = Some(search);
-                        (track.id.clone(), track.name.clone())
-                    }
-                    Some(YoutubeAPI::Video) => {
-                        let (video, search) = Self::query_ytvideo(self.last_search.clone()).await?;
-                        self.last_search = Some(search);
-                        (video.id.clone(), video.name.clone())
-                    }
-                    None => return Ok(()),
+                let search_term = match self.last_search.clone() {
+                    Some(s) if !s.trim().is_empty() => s,
+                    _ => crate::bootstrap::prompt_text("Youtube Search")?,
                 };
+                let (video_id, video_name) = self.pick_media(&search_term).await?;
+                self.last_search = Some(search_term);
+                debug!(?video_id, ?video_name, "run: downloading");
                 match format {
                     Format::Audio { format } => {
-                        self.download_audio(video_id, &video_name, format, &self.args)
+                        Self::download_audio(video_id, &video_name, format, &self.args)
                             .await?;
                     }
                     Format::Video { format } => {
-                        self.download_video(&video_id, &video_name, format, &self.args)
+                        Self::download_video(&video_id, &video_name, format, &self.args)
                             .await?;
                     }
                 }
             }
             AppAction::Transcript => {
-                if !self.libraries_exist(&self.args.clone()) {
+                info!("run: transcript action");
+                if !Self::libraries_exist(&self.args.clone()) {
                     Self::install_lib(&self.args).await?;
                 }
-                let video_id = match self.api {
-                    Some(YoutubeAPI::Music) => {
-                        let (track, search) = Self::query_ytmusic(self.last_search.clone()).await?;
-                        self.last_search = Some(search);
-                        track.id.clone()
-                    }
-                    Some(YoutubeAPI::Video) => {
-                        let (video, search) = Self::query_ytvideo(self.last_search.clone()).await?;
-                        self.last_search = Some(search);
-                        video.id.clone()
-                    }
-                    None => unreachable!(),
+                let search_term = match self.last_search.clone() {
+                    Some(s) if !s.trim().is_empty() => s,
+                    _ => crate::bootstrap::prompt_text("Youtube Search")?,
                 };
+                let (video_id, _) = self.pick_media(&search_term).await?;
+                self.last_search = Some(search_term);
+                debug!(?video_id, "run: downloading transcript");
                 self.download_transcript(&video_id, &self.args).await?;
             }
             AppAction::Player { format } => {
+                info!(?format, "run: player action");
                 if !self.mpv_installed {
                     self.mpv_installed = Self::check_mpv()?;
+                    debug!(mpv_installed = self.mpv_installed, "run: rechecked MPV");
                 }
-                let mut response = match self.api {
-                    Some(YoutubeAPI::Music) => {
-                        if self.player {
-                            None
-                        } else {
-                            let res = Self::query_ytmusic(self.last_search.clone()).await?;
-                            self.last_search = Some(res.1);
-                            Some(YoutubeResponse::Track(res.0))
-                        }
+                // URLs resolve straight to a response (no prompt);
+                // anything else opens the empty hub and searches from the TUI.
+                let mut response = match self.last_search.clone() {
+                    Some(s) if s.starts_with("http") => {
+                        self.match_url_response(&s).await?
                     }
-                    Some(YoutubeAPI::Video) => {
-                        let res = Self::query_ytvideo(self.last_search.clone()).await?;
-                        self.last_search = Some(res.1);
-                        Some(YoutubeResponse::Video(res.0))
-                    }
-                    None => None,
+                    _ => None,
                 };
-                if response.is_none() {
-                    self.player(
-                        &mut None,
-                        &mut None,
-                        match format {
-                            Format::Audio { .. } => true,
-                            Format::Video { .. } => false,
-                        },
-                        self.run_midi,
-                    )
+                debug!(
+                    has_response = response.is_some(),
+                    "run: launching TUI"
+                );
+                let mut opt_thumbnail = if let Some(res) = &response {
+                    Self::fetch_yt_thumbnail(&res.get_id(), &self.args)
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                let launch = LaunchOptions {
+                    audio_only: matches!(format, Format::Audio { .. }),
+                    vo: self.vo.clone(),
+                    embed: self.embed,
+                    audio_device: self.audio_device.clone(),
+                    midi: self.run_midi,
+                    no_art: self.no_art,
+                    img_protocol: self.img_protocol,
+                };
+                self.run_tui(&mut response, &mut opt_thumbnail, launch)
                     .await;
-                    return Ok(());
-                }
-                match format {
-                    Format::Audio { .. } => {
-                        let mut opt_thumbnail = if let Some(res) = &response {
-                            Self::fetch_yt_thumbnail(&res.get_id(), &self.args)
-                                .await
-                                .ok()
-                        } else {
-                            None
-                        };
-                        self.player(&mut response, &mut opt_thumbnail, true, self.run_midi)
-                            .await;
-                    }
-                    Format::Video { .. } => {
-                        let mut opt_thumbnail = if let Some(res) = &response {
-                            Self::fetch_yt_thumbnail(&res.get_id(), &self.args)
-                                .await
-                                .ok()
-                        } else {
-                            None
-                        };
-                        self.player(&mut response, &mut opt_thumbnail, false, self.run_midi)
-                            .await;
-                    }
-                }
             }
             AppAction::Quit => return Err(YtrsError::Quit.into()),
+            AppAction::Update => {
+                crate::bootstrap::update_yt_dlp(self.args.clone());
+            }
         }
         Ok(())
     }
-    async fn player(
+    /// Query terminal graphics support once (call after TUI init).
+    /// An explicit `--img-protocol` choice is applied, otherwise the
+    /// auto-detected protocol is kept as-is.
+    fn make_picker(pref: ImgProtocol) -> Option<picker::Picker> {
+        match picker::Picker::from_query_stdio() {
+            Ok(mut picker) => {
+                match pref {
+                    ImgProtocol::Halfblocks => {
+                        picker.set_protocol_type(picker::ProtocolType::Halfblocks)
+                    }
+                    ImgProtocol::Kitty => {
+                        picker.set_protocol_type(picker::ProtocolType::Kitty)
+                    }
+                    ImgProtocol::Iterm2 => {
+                        picker.set_protocol_type(picker::ProtocolType::Iterm2)
+                    }
+                    ImgProtocol::Auto => {}
+                }
+                debug!(
+                    protocol = ?picker.protocol_type(),
+                    font_size = ?picker.font_size(),
+                    "picker: graphics protocol selected"
+                );
+                Some(picker)
+            }
+            Err(e) => {
+                debug!(?e, "picker: terminal query failed, no artwork");
+                None
+            }
+        }
+    }
+
+    /// Spawn mpv from launch options, apply the audio output device,
+    /// and observe volume + playback-time + idle state.
+    ///
+    /// Video plays in mpv's own window (default vo); only `--embed` and an
+    /// explicit `--vo` change the video output.
+    async fn spawn_mpv(
+        launch: &LaunchOptions,
+        audio_only: bool,
+        audio_device: Option<String>,
+    ) -> Result<(
+        MpvIpc,
+        tokio::sync::watch::Receiver<f64>,
+        tokio::sync::watch::Receiver<f64>,
+        tokio::sync::watch::Receiver<bool>,
+    )> {
+        let mut opts = MpvSpawnOptions {
+            ..Default::default()
+        };
+        // In embed mode, always enable video so a vo is used
+        let spawn_audio_only = if launch.embed { false } else { audio_only };
+        if spawn_audio_only {
+            // Audio stays headless; mpv needs no video output.
+        } else if launch.embed {
+            // Embed owns the terminal: explicit vo (kitty default).
+            opts.vo = Some(launch.vo.clone().unwrap_or_else(|| "kitty".to_string()));
+        } else if let Some(vo) = launch.vo.clone() {
+            // Plain video mode (own window): only an explicit --vo is passed.
+            opts.vo = Some(vo);
+        }
+        let mut mpv = MpvIpc::spawn(&opts, spawn_audio_only).await?;
+        debug!("run_tui: MPV spawned, applying audio output");
+        if let Some(dev) = &audio_device {
+            if let Err(e) = mpv.set_prop("audio-device", dev).await {
+                warn!(?e, ?dev, "spawn_mpv: could not apply audio-device");
+            }
+        }
+        let mpv_vol = mpv.observe_prop::<f64>("volume", 1.0).await;
+        let time_rx = mpv.observe_prop::<f64>("playback-time", 0.0).await;
+        let idle_rx = mpv.observe_prop::<bool>("idle-active", true).await;
+        Ok((mpv, mpv_vol, time_rx, idle_rx))
+    }
+
+    /// Load the current response or local file into a (fresh) mpv instance.
+    async fn load_media(
+        mpv: &mut MpvIpc,
+        response: &Option<YoutubeResponse>,
+        file: &Option<(TaggedFile, String)>,
+        audio_only: bool,
+        args: &Cli,
+    ) {
+        if let Some(res) = response {
+            let video_id = res.get_id();
+            let url = Self::resolve_stream_url(args, &video_id, audio_only).await;
+            debug!(url = %url[..url.len().min(80)], "load_media: resolved stream URL");
+            match mpv.send_command(json!(["loadfile", url])).await {
+                Ok(val) => debug!(?val, "load_media: loadfile command succeeded"),
+                Err(e) => error!(?e, "load_media: loadfile command FAILED"),
+            }
+        } else if let Some(file) = file {
+            debug!(path = %file.1, "load_media: loading local file into MPV");
+            if let Err(e) = mpv.send_command(json!(["loadfile", file.1])).await {
+                error!(?e, "load_media: failed to load local file");
+            }
+        } else {
+            debug!("load_media: empty player mode, no media to load");
+        }
+    }
+
+    async fn run_tui(
         &mut self,
         response: &mut Option<YoutubeResponse>,
         opt_thumbnail: &mut Option<DynamicImage>,
-        audio_only: bool,
-        run_midi: bool,
+        launch: LaunchOptions,
     ) {
-        let mut midi_in = MidiInput::new("midir reading input").expect("Could not open Midi Input");
-        midi_in.ignore(midir::Ignore::None);
-        let midi_out =
-            MidiOutput::new("midir forwarding output").expect("Could not open Midi Output");
-        let in_port = midi_in.ports();
-        let out_port = midi_out.ports();
-        let opt_midi_in_port: Option<&MidiInputPort> = if !run_midi {
-            None
-        } else {
-            match in_port.len() {
-                0 => None,
-                1 => Some(&in_port[0]),
-                _ => {
-                    let filter = |(i, p): (usize, &MidiInputPort)| -> String {
-                        format!("{i}:{}", midi_in.port_name(p).unwrap())
-                    };
-                    let mut inputs = vec![String::from("None")];
-                    in_port
-                        .iter()
-                        .enumerate()
-                        .for_each(|(i, p)| inputs.push(filter((i, p))));
-                    let res = inquire::Select::new("Select Midi Input Port", inputs)
-                        .prompt()
-                        .unwrap();
-                    let port = in_port
-                        .iter()
-                        .enumerate()
-                        .find(|(i, p)| filter((*i, p)) == res);
-                    match port {
-                        Some(p) => Some(&in_port[p.0]),
-                        None => None,
-                    }
-                }
-            }
-        };
-        let opt_midi_out_port: Option<&MidiOutputPort> = if !run_midi {
-            None
-        } else {
-            match out_port.len() {
-                0 => None,
-                1 => Some(&out_port[0]),
-                _ => {
-                    let filter = |(i, p): (usize, &MidiOutputPort)| -> String {
-                        format!("{i}:{}", midi_out.port_name(p).unwrap())
-                    };
-                    let mut inputs = vec![String::from("None")];
-                    out_port
-                        .iter()
-                        .enumerate()
-                        .for_each(|(i, p)| inputs.push(filter((i, p))));
-                    let res = inquire::Select::new("Select Midi Output Port", inputs)
-                        .prompt()
-                        .unwrap();
-                    let port = out_port
-                        .iter()
-                        .enumerate()
-                        .find(|(i, p)| filter((*i, p)) == res);
-                    match port {
-                        Some(p) => Some(&out_port[p.0]),
-                        None => None,
-                    }
-                }
-            }
-        };
+        info!(
+            ?launch,
+            has_response = response.is_some(),
+            "run_tui: starting"
+        );
+        // TUI first: launch options drive MPV, audio output and MIDI below.
+        debug!("run_tui: initializing ratatui terminal");
+        let mut term = ratatui::init();
+        debug!(
+            size = ?ratatui::crossterm::terminal::size(),
+            "run_tui: terminal size"
+        );
+        // Single graphics-protocol query for this session (honors --img-protocol).
+        let picker = Self::make_picker(launch.img_protocol);
+        // Thumbnail / Album cover
+        debug!("run_tui: setting up thumbnail");
         let mut img = if let Some(dyn_thumbnail) = &opt_thumbnail
-            && let Ok(picker) = picker::Picker::from_query_stdio()
+            && let Some(picker) = picker.as_ref()
         {
             let protocol = picker.new_resize_protocol(dyn_thumbnail.clone());
             Some(protocol)
         } else {
             None
         };
+        // MPV
+        debug!("run_tui: checking for local file");
         let mut empty_player = false;
         let mut audio_file_error = None;
-        let mut file: Option<(TaggedFile, String)> = {
-            if let Some(s) = &self.last_search
-                && !s.is_empty()
-            {
-                let f = PathBuf::from(s);
-                if f.exists() && f.is_file() {
-                    use lofty::probe::Probe;
-                    if let Ok(file) = Probe::open(&f) {
-                        match file.guess_file_type() {
-                            Ok(file) => match file.read() {
-                                Ok(tagged_file) => {
-                                    if let Some(tag) = tagged_file.primary_tag()
-                                        && let Some(pic) = tag.pictures().first()
-                                        && let Ok(dyn_img) = image::load_from_memory(pic.data())
-                                    {
-                                        img = if let Ok(picker) = picker::Picker::from_query_stdio()
-                                        {
-                                            let protocole =
-                                                picker.new_resize_protocol(dyn_img.clone());
-                                            Some(protocole)
-                                        } else {
-                                            None
-                                        };
-                                    }
-                                    Some((tagged_file, f.to_string_lossy().to_string()))
-                                }
-                                Err(e) => {
-                                    audio_file_error = Some(format!("Could not read file {e}"));
-                                    None
-                                }
-                            },
-                            Err(e) => {
-                                audio_file_error = Some(format!("Could not guess file type: {e}"));
-                                None
-                            }
-                        }
-                    } else {
-                        audio_file_error = Some("Could not open file".to_string());
-                        None
-                    }
-                } else {
-                    audio_file_error =
-                        Some(format!("File '{}' does not exist", f.to_string_lossy()));
-                    None
-                }
-            } else {
-                empty_player = true;
-                None
+        let mut file: Option<(TaggedFile, String)> = self.get_file(
+            &mut img,
+            &mut empty_player,
+            &mut audio_file_error,
+            picker.as_ref(),
+        );
+        if file.is_none() && response.is_none() && !empty_player {
+            // Opened for in-TUI search: don't crash, search from the player.
+            warn!(?audio_file_error, "run_tui: no media yet, opening empty player");
+            empty_player = true;
+        }
+        debug!(
+            has_file = file.is_some(),
+            empty_player,
+            ?audio_file_error,
+            "run_tui: file check result"
+        );
+        debug!("run_tui: spawning MPV");
+        let mut audio_only = launch.audio_only;
+        let mut current_audio_device = launch.audio_device.clone();
+        let (mut mpv, mut mpv_vol, mut time_rx, mut idle_rx) = Self::spawn_mpv(
+            &launch,
+            audio_only,
+            current_audio_device.clone(),
+        )
+        .await
+        .context("Failed to spawn mpv process")
+        .expect("Could not spawn MPV");
+        Self::load_media(&mut mpv, response, &file, audio_only, &self.args).await;
+        // Embed mode: skip TUI, just wait for mpv to exit
+        if launch.embed && !audio_only {
+            debug!("run_tui: embed mode active, skipping TUI");
+            println!("Playing in terminal... Press Ctrl+C to exit");
+            while mpv.running().await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        };
-        let opts = MpvSpawnOptions::default();
-        let mut mpv = MpvIpc::spawn(&opts, audio_only)
-            .await
-            .context("Failed to spawn mpv process")
-            .expect("Could not spawn MPV");
-        let mpv_vol = mpv.observe_prop::<f64>("volume", 1.0).await;
-        if let Some(res) = response {
-            mpv.send_command(json!(["loadfile", Self::get_video_url(&res.get_id())]))
-                .await
-                .context("Failed to load media")
-                .expect("Could not send command to MPV");
-        } else if let Some(file) = &file {
-            mpv.send_command(json!(["loadfile", file.1]))
-                .await
-                .context("Failed to load media")
-                .expect("Could not send command to MPV");
-        } else if empty_player {
-            // Pass
-        } else {
-            panic!(
-                "Error : {}",
-                audio_file_error.unwrap_or("No file found".to_string())
+            mpv.quit().await;
+            ratatui::restore();
+            return;
+        }
+        // MIDI runtime: first ports auto-selected, reconfigurable in the setup menu.
+        debug!("run_tui: initializing MIDI runtime");
+        let mut midi = MidiRuntime::new();
+        if launch.midi {
+            midi.connect_input(
+                MidiInput::new("ytrs-midi-in")
+                    .ok()
+                    .and_then(|m| m.ports().first().cloned()),
+            );
+            midi.connect_output(
+                MidiOutput::new("ytrs-midi-out")
+                    .ok()
+                    .and_then(|m| m.ports().first().cloned()),
             );
         }
-        let (midi_volume_tx, midi_volume_rx) = std::sync::mpsc::channel();
-        let (midi_pause_tx, midi_pause_rx) = std::sync::mpsc::channel();
-        let _conn_in = if let Some(in_port) = opt_midi_in_port {
-            midi_in
-                .connect(
-                    in_port,
-                    "midir-read-input",
-                    move |_, message, midi_tx| {
-                        let midi_event = midi::parse_midi(message);
-                        match midi_event {
-                            midi::MidiEvent::NoteOn {
-                                channel: _,
-                                note,
-                                velocity: _,
-                            } => {
-                                if matches!(note, 93 | 94) {
-                                    let _ = midi_tx.1.send(());
-                                }
-                            }
-                            midi::MidiEvent::PitchBend { channel: _, value } => {
-                                let _ = midi_tx.0.send(pitch_bend_to_mpv_vol(value));
-                            }
-                            _ => {}
-                        }
-                    },
-                    (midi_volume_tx, midi_pause_tx),
-                )
-                .ok()
-        } else {
-            None
-        };
-        let mut conn_out = if let Some(out_port) = opt_midi_out_port {
-            midi_out.connect(out_port, "midir-forward").ok()
-        } else {
-            None
-        };
-        let mut term = ratatui::init();
-        let time_rx = mpv.observe_prop::<f64>("playback-time", 0.0).await;
+        // App Setup
+        debug!("run_tui: entering TUI main loop");
         let mut playback_time = 0.0;
         let mut vid_started = false;
-        let loader = ["/", "|", "\\", "-"];
-        let mut loader_idx = 0;
+        let mut loader = ui::Loader::default();
         let mut pause_state = false;
         let mut open_popup = false;
         let mut videos_list: Vec<(String, YoutubeResponse)> = Vec::new();
         let mut selected_list_item = ListState::default();
         let mut popup_query = String::new();
+        let mut search_task: Option<SearchTask> = None;
+        let mut search_error: Option<String> = None;
+        let mut transcript = ui::TranscriptState::default();
+        let mut setup = ui::SetupState::default();
+        let mut playlist = Playlist::default();
+        let mut audio_device_names: Vec<String> = Vec::new();
+        // Last seen mpv idle state, for playlist auto-advance on track end.
+        let mut was_idle = true;
+
+        // Theme and sidebar
+        let mut theme = Theme::load();
+        let (_, output_dir) = Self::get_libs_path(&self.args);
+        let mut sidebar = Sidebar::new();
 
         // TUI Main Loop
+        debug!("player: entering TUI main loop");
+        // With --no-art the artwork stays empty.
+        let mut no_art_img: Option<ratatui_image::protocol::StatefulProtocol> = None;
         loop {
-            if let Some(v) = midi_volume_rx.try_iter().last() {
+            if let Some(v) = midi.volume_rx.try_iter().last() {
                 // v is from 0 to 130
                 mpv.send_command(json!(["set_property", "volume", v]))
                     .await
                     .unwrap();
             }
-            if let Ok(()) = midi_pause_rx.try_recv() {
+            if let Ok(()) = midi.pause_rx.try_recv() {
                 pause_state = !pause_state;
                 let _ = mpv.set_prop("pause", pause_state).await;
             }
@@ -811,31 +767,158 @@ impl YoutubeRs {
             if playback_time == 0.0 && !vid_started {
                 vid_started = true;
             }
+            // Track ended (mpv went idle): advance in the playlist with
+            // wraparound, forever. Only when playing a queued entry.
+            let _ = idle_rx.has_changed();
+            let idle_now = *idle_rx.borrow();
+            if !was_idle && idle_now {
+                if Self::play_next_queued(
+                    response,
+                    &mut file,
+                    &mut mpv,
+                    &mut img,
+                    &self.args,
+                    &mut playlist,
+                    audio_only,
+                    picker.as_ref(),
+                )
+                .await
+                {
+                    debug!("playlist: track ended, advancing");
+                }
+            }
+            was_idle = idle_now;
+
+            // Background search finished: collect without blocking.
+            // `await` on a finished JoinHandle returns immediately.
+            if search_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = search_task.take().expect("search task checked above");
+                match task.await {
+                    Ok(Ok(items)) => {
+                        debug!(count = items.len(), "run_tui: background search done");
+                        videos_list = items;
+                        selected_list_item
+                            .select(videos_list.first().map(|_| 0));
+                        popup_query.clear();
+                        search_error = None;
+                    }
+                    Ok(Err(e)) => {
+                        warn!(?e, "run_tui: background search failed");
+                        search_error = Some(e);
+                    }
+                    Err(e) => {
+                        debug!(?e, "run_tui: background search cancelled");
+                        search_error = None;
+                    }
+                }
+            }
 
             let _ = term.draw(|f| {
-                self.draw(
-                    response,
-                    playback_time,
-                    vid_started,
-                    loader,
-                    &mut loader_idx,
-                    open_popup,
-                    &videos_list,
-                    &mut selected_list_item,
-                    &popup_query,
-                    &mut img,
-                    f,
-                    &mut file,
-                    empty_player,
-                    &mpv_vol.borrow(),
-                );
+                let mut ctx = ui::DrawCtx {
+                    playback: ui::Playback {
+                        time: playback_time,
+                        started: vid_started,
+                        volume: *mpv_vol.borrow(),
+                    },
+                    loader: &mut loader,
+                    search_open: open_popup,
+                    search: ui::SearchView {
+                        results: &videos_list,
+                        selected: &mut selected_list_item,
+                        query: &popup_query,
+                        api: self.api,
+                        searching: search_task.is_some(),
+                        notice: search_error.as_deref().unwrap_or(""),
+                    },
+                    transcript: &transcript,
+                    setup: &setup,
+                    playlist: &playlist,
+                    media: ui::Media::from_parts(response, &file, empty_player),
+                    artwork: if launch.no_art { &mut no_art_img } else { &mut img },
+                    theme: &theme,
+                    sidebar: &mut sidebar,
+                };
+                ui::draw_screen(&mut ctx, f);
             });
-            let event_happened = ratatui::crossterm::event::poll(Duration::from_millis(50)).ok();
-            if let Some(has_happened) = event_happened
-                && has_happened
-            {
+            let event_happened = ratatui::crossterm::event::poll(Duration::from_millis(50))
+                .is_ok_and(|event_happened| event_happened);
+            if event_happened {
                 let event = read().unwrap();
-                if open_popup {
+                if setup.open {
+                    match Self::handle_setup_event(
+                        &mut setup,
+                        &mut mpv,
+                        &mut midi,
+                        &mut audio_device_names,
+                        &mut current_audio_device,
+                        &mut theme,
+                        &event,
+                    )
+                    .await
+                    {
+                        SetupOutcome::Continue => {}
+                        SetupOutcome::Respawn { audio_only: new_mode } => {
+                            audio_only = new_mode;
+                            debug!(audio_only, "run_tui: respawning mpv from setup");
+                            mpv.quit().await;
+                            (mpv, mpv_vol, time_rx, idle_rx) = Self::spawn_mpv(
+                                &launch,
+                                audio_only,
+                                current_audio_device.clone(),
+                            )
+                            .await
+                            .context("Failed to respawn mpv process")
+                            .expect("Could not respawn MPV");
+                            playback_time = 0.0;
+                            vid_started = false;
+                            pause_state = false;
+                            was_idle = true;
+                            Self::load_media(
+                                &mut mpv,
+                                response,
+                                &file,
+                                audio_only,
+                                &self.args,
+                            )
+                            .await;
+                        }
+                    }
+                } else if transcript.open {
+                    Self::handle_transcript_event(
+                        &mut transcript,
+                        response,
+                        &self.args,
+                        &event,
+                    )
+                    .await;
+                } else if playlist.open {
+                    Self::handle_playlist_event(
+                        &mut playlist,
+                        response,
+                        &mut file,
+                        &mut mpv,
+                        &mut img,
+                        audio_only,
+                        picker.as_ref(),
+                        &self.args,
+                        &event,
+                    )
+                    .await;
+                } else if sidebar.open {
+                    self.handle_sidebar_event(
+                        &mut sidebar,
+                        &mut mpv,
+                        &output_dir,
+                        response,
+                        &mut file,
+                        &mut img,
+                        picker.as_ref(),
+                        &mut playlist,
+                        &mut transcript,
+                        &event,
+                    )
+                    .await;
+                } else if open_popup {
                     self.handle_popup_event(
                         response,
                         &mut mpv,
@@ -844,28 +927,237 @@ impl YoutubeRs {
                         &mut selected_list_item,
                         &mut popup_query,
                         &mut img,
+                        audio_only,
+                        picker.as_ref(),
+                        &mut playlist,
+                        &mut search_task,
+                        &mut search_error,
                         &event,
                     )
                     .await;
                 } else if let ControlFlow::Break(_) = self
                     .handle_playback_event(
                         response,
+                        &mut file,
                         &mut mpv,
                         &mut pause_state,
                         &mut open_popup,
                         event,
                         empty_player,
-                        &mut conn_out,
+                        &mut midi,
                         &mpv_vol.borrow(),
+                        &mut sidebar,
+                        &output_dir,
+                        &mut transcript,
+                        &mut setup,
+                        &mut audio_device_names,
+                        &mut playlist,
+                        &mut img,
+                        audio_only,
+                        picker.as_ref(),
                     )
                     .await
                 {
+                    if let Some(task) = search_task.take() {
+                        task.abort();
+                    }
                     break;
                 }
             }
         }
         mpv.quit().await;
         ratatui::restore();
+    }
+
+    fn get_file(
+        &mut self,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        empty_player: &mut bool,
+        audio_file_error: &mut Option<String>,
+        picker: Option<&picker::Picker>,
+    ) -> Option<(TaggedFile, String)> {
+        if let Some(s) = &self.last_search
+            && !s.is_empty()
+        {
+            debug!(path = %s, "get_file: checking path");
+            let f = PathBuf::from(s);
+            if f.exists() && f.is_file() {
+                debug!(path = %f.display(), "get_file: file exists, probing");
+                use lofty::probe::Probe;
+                if let Ok(file) = Probe::open(&f) {
+                    match file.guess_file_type() {
+                        Ok(file) => match file.read() {
+                            Ok(tagged_file) => {
+                                debug!("get_file: file read successfully");
+                                if let Some(tag) = tagged_file.primary_tag()
+                                    && let Some(pic) = tag.pictures().first()
+                                    && let Ok(dyn_img) = image::load_from_memory(pic.data())
+                                    && let Some(picker) = picker
+                                {
+                                    debug!("get_file: found album art");
+                                    let protocole =
+                                        picker.new_resize_protocol(dyn_img.clone());
+                                    *img = Some(protocole);
+                                }
+                                Some((tagged_file, f.to_string_lossy().to_string()))
+                            }
+                            Err(e) => {
+                                error!(?e, "get_file: could not read file");
+                                *audio_file_error = Some(format!("Could not read file {e}"));
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            error!(?e, "get_file: could not guess file type");
+                            *audio_file_error = Some(format!("Could not guess file type: {e}"));
+                            None
+                        }
+                    }
+                } else {
+                    error!("get_file: could not open file");
+                    *audio_file_error = Some("Could not open file".to_string());
+                    None
+                }
+            } else {
+                warn!(path = %f.display(), "get_file: file does not exist");
+                *audio_file_error = Some(format!("File '{}' does not exist", f.to_string_lossy()));
+                None
+            }
+        } else {
+            debug!("get_file: no path in last_search, setting empty_player=true");
+            *empty_player = true;
+            None
+        }
+    }
+
+    /// Probe a path into tagged audio + display path. No UI side effects.
+    fn probe_file(path: &Path) -> Option<(TaggedFile, String)> {
+        use lofty::probe::Probe;
+        let probed = Probe::open(path).ok()?;
+        let tagged = probed.guess_file_type().ok()?.read().ok()?;
+        Some((tagged, path.to_string_lossy().to_string()))
+    }
+
+    /// Album art of tagged audio as an image protocol, if any.
+    fn album_art(
+        tagged: &TaggedFile,
+        picker: Option<&picker::Picker>,
+    ) -> Option<ratatui_image::protocol::StatefulProtocol> {
+        let pic = tagged.primary_tag()?.pictures().first()?;
+        let dyn_img = image::load_from_memory(pic.data()).ok()?;
+        Some(picker?.new_resize_protocol(dyn_img))
+    }
+
+    /// Load a stream response into mpv (thumbnail + stream) and remember it.
+    #[allow(clippy::too_many_arguments)]
+    async fn play_stream(
+        response: &mut Option<YoutubeResponse>,
+        mpv: &mut MpvIpc,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        args: &Cli,
+        vid: YoutubeResponse,
+        audio_only: bool,
+        picker: Option<&picker::Picker>,
+    ) {
+        let video_id = vid.get_id();
+        debug!(?video_id, "play_item: loading stream into mpv");
+        let url = Self::resolve_stream_url(args, &video_id, audio_only).await;
+        match mpv.send_command(json!(["loadfile", url])).await {
+            Ok(_) => debug!("play_item: loadfile command succeeded"),
+            Err(e) => error!(?e, "play_item: loadfile command FAILED"),
+        }
+        *img = Self::load_thumbnail(args, &vid.get_id(), picker).await;
+        *response = Some(vid);
+    }
+
+    /// Load a local file into mpv and remember it (tags + cover refreshed).
+    #[allow(clippy::too_many_arguments)]
+    async fn play_file(
+        response: &mut Option<YoutubeResponse>,
+        file: &mut Option<(TaggedFile, String)>,
+        mpv: &mut MpvIpc,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        path: String,
+        picker: Option<&picker::Picker>,
+    ) {
+        debug!(?path, "play_item: loading local file into mpv");
+        *response = None;
+        match Self::probe_file(Path::new(&path)) {
+            Some((tagged, name)) => {
+                match mpv.send_command(json!(["loadfile", name])).await {
+                    Ok(_) => debug!("play_item: loadfile command succeeded"),
+                    Err(e) => error!(?e, "play_item: loadfile command FAILED"),
+                }
+                if let Some(art) = Self::album_art(&tagged, picker) {
+                    *img = Some(art);
+                }
+                *file = Some((tagged, name));
+            }
+            None => error!(?path, "play_item: could not read local file"),
+        }
+    }
+
+    /// Load a queue entry into mpv and remember it: streams resolve to a URL,
+    /// local files play directly with refreshed tags + cover art.
+    #[allow(clippy::too_many_arguments)]
+    async fn play_item(
+        response: &mut Option<YoutubeResponse>,
+        file: &mut Option<(TaggedFile, String)>,
+        mpv: &mut MpvIpc,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        args: &Cli,
+        item: PlaylistItem,
+        audio_only: bool,
+        picker: Option<&picker::Picker>,
+    ) {
+        match item {
+            PlaylistItem::Stream(vid) => {
+                Self::play_stream(response, mpv, img, args, vid, audio_only, picker).await;
+            }
+            PlaylistItem::File(path) => {
+                Self::play_file(response, file, mpv, img, path, picker).await;
+            }
+        }
+    }
+
+    /// Run a YouTube/Music search off the TUI event loop.
+    /// Returns display rows or an error string for the popup status line.
+    async fn run_search(
+        api: YoutubeAPI,
+        query: String,
+    ) -> Result<Vec<(String, YoutubeResponse)>, String> {
+        match api {
+            YoutubeAPI::Music => {
+                let found = RustyPipe::new()
+                    .query()
+                    .unauthenticated()
+                    .music_search_tracks(query)
+                    .await
+                    .map_err(|e| format!("YouTube Music search failed: {e:#}"))?;
+                YoutubeRs::cleanup_rustypipe_cache();
+                Ok(found
+                    .items
+                    .items
+                    .into_iter()
+                    .map(|track| (TrackInfo::from(&track).to_string(), track.into()))
+                    .collect())
+            }
+            YoutubeAPI::Video => {
+                let found: rustypipe::model::SearchResult<VideoItem> = RustyPipe::new()
+                    .query()
+                    .unauthenticated()
+                    .search(query)
+                    .await
+                    .map_err(|e| format!("YouTube search failed: {e:#}"))?;
+                YoutubeRs::cleanup_rustypipe_cache();
+                Ok(found
+                    .items
+                    .items
+                    .iter()
+                    .map(|v| (VideoInfo::from(v).to_string(), v.into()))
+                    .collect())
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -878,10 +1170,27 @@ impl YoutubeRs {
         selected_list_item: &mut ListState,
         popup_query: &mut String,
         img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        audio_only: bool,
+        picker: Option<&picker::Picker>,
+        playlist: &mut Playlist,
+        search_task: &mut Option<SearchTask>,
+        search_error: &mut Option<String>,
         event: &ratatui::crossterm::event::Event,
     ) {
+        // Item under the cursor when the input is empty: `p` appends it to
+        // the playlist instead of being typed. Otherwise `p` types normally.
+        let picked = if popup_query.is_empty() {
+            selected_list_item
+                .selected()
+                .and_then(|i| videos_list.get(i))
+                .map(|v| v.1.clone())
+        } else {
+            None
+        };
+        // NOTE: `p` with a picked item is the playlist shortcut below, not text.
         if event.is_key_press()
             && let KeyCode::Char(ch) = event.as_key_event().unwrap().code
+            && (ch != 'p' || picked.is_none())
         {
             popup_query.push(ch);
         }
@@ -893,11 +1202,21 @@ impl YoutubeRs {
             }
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Tab {
-            self.api = match self.api {
-                Some(YoutubeAPI::Music) => Some(YoutubeAPI::Video),
-                Some(YoutubeAPI::Video) => Some(YoutubeAPI::Music),
-                None => None,
-            };
+            // Switch the search source only: mpv keeps playing untouched.
+            // Audio-only vs video is controlled from the setup menu.
+            match self.api {
+                Some(YoutubeAPI::Music) => self.api = Some(YoutubeAPI::Video),
+                Some(YoutubeAPI::Video) => self.api = Some(YoutubeAPI::Music),
+                None => self.api = Some(YoutubeAPI::Video),
+            }
+            // Drop results from the other source, but keep the query text
+            // so Enter re-runs it right away.
+            videos_list.clear();
+            selected_list_item.select(None);
+            search_error.take();
+            if let Some(task) = search_task.take() {
+                task.abort();
+            }
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Up {
             selected_list_item.select_previous();
@@ -906,7 +1225,11 @@ impl YoutubeRs {
             selected_list_item.select_next();
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Esc {
-            *open_popup = !*open_popup;
+            if let Some(task) = search_task.take() {
+                task.abort();
+            }
+            *open_popup = false;
+            selected_list_item.select(None);
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Enter {
             if let Some(selected) = selected_list_item.selected()
@@ -914,269 +1237,53 @@ impl YoutubeRs {
             {
                 if let Some(vid) = videos_list.get(selected).map(|v| v.1.clone()) {
                     popup_query.clear();
-                    mpv.send_command(json!(["loadfile", Self::get_video_url(&vid.get_id())]))
-                        .await
-                        .context("Failed to load media")
-                        .expect("Could not send command to MPV");
-                    if let Ok(thumbnail) = Self::fetch_yt_thumbnail(&vid.get_id(), &self.args).await
-                    {
-                        *img = if let Ok(picker) = picker::Picker::from_query_stdio() {
-                            let protocol = picker.new_resize_protocol(thumbnail.clone());
-                            Some(protocol)
-                        } else {
-                            None
-                        };
-                    } else {
-                        *img = None;
-                    }
-                    *response = Some(vid);
+                    Self::play_stream(
+                        response,
+                        mpv,
+                        img,
+                        &self.args,
+                        vid,
+                        audio_only,
+                        picker,
+                    )
+                    .await;
+                    // Back to the Player view (gauge + info panel).
                     videos_list.clear();
+                    selected_list_item.select(None);
+                    *open_popup = false;
                 }
             } else if !popup_query.is_empty() {
-                match self.api {
-                    Some(YoutubeAPI::Music) => {
-                        let rp = RustyPipe::new();
-                        let found_videos = rp
-                            .query()
-                            .unauthenticated()
-                            .music_search_tracks(popup_query.clone())
-                            .await
-                            .context("Failed to search YouTube Music")
-                            .expect("Failed to fetch youtube with rustypipe");
-                        YoutubeRs::cleanup_rustypipe_cache();
-                        *videos_list = found_videos
-                            .clone()
-                            .items
-                            .items
-                            .into_iter()
-                            .map(|track| (TrackInfo::from(&track).to_string(), track.into()))
-                            .collect();
-                        popup_query.clear();
-                    }
-                    Some(YoutubeAPI::Video) => {
-                        let found_videos = RustyPipe::new()
-                            .query()
-                            .unauthenticated()
-                            .search(popup_query.clone())
-                            .await
-                            .context("Failed to search YouTube")
-                            .unwrap();
-                        YoutubeRs::cleanup_rustypipe_cache();
-                        *videos_list = found_videos
-                            .items
-                            .items
-                            .iter()
-                            .map(|v| (VideoInfo::from(v).to_string(), v.into()))
-                            .collect();
-                        popup_query.clear();
-                    }
-                    None => {}
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw(
-        &mut self,
-        response: &mut Option<YoutubeResponse>,
-        playback_time: f64,
-        vid_started: bool,
-        loader: [&str; 4],
-        loader_idx: &mut usize,
-        open_popup: bool,
-        videos_list: &[(String, YoutubeResponse)],
-        selected_list_item: &mut ListState,
-        popup_query: &String,
-        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
-        f: &mut Frame<'_>,
-        file: &mut Option<(TaggedFile, String)>,
-        empty_player: bool,
-        mpv_vol: &f64,
-    ) {
-        if vid_started {
-            // General Layout
-            let layout = Layout::vertical(Constraint::from_percentages([60, 40])).split(f.area());
-            // Top Image
-            if let Some(protocol) = img {
-                let img_layout = layout[0];
-                // remove 50% width on both sides
-                let img_layout = img_layout.centered_horizontally(Constraint::Percentage(50));
-                // Size of the image once resized to the area to fit
-                let img_size = protocol.size_for(ratatui_image::Resize::Scale(None), img_layout);
-                let width_dif = img_layout.width - img_size.width;
-                let height_dif = img_layout.height - img_size.height;
-                let img_place = Rect::new(
-                    img_layout.x + width_dif / 2,
-                    img_layout.y + height_dif / 2,
-                    img_layout.width,
-                    img_layout.height,
-                );
-                f.render_stateful_widget(
-                    StatefulImage::default().resize(ratatui_image::Resize::Scale(None)),
-                    img_place,
-                    protocol,
-                );
-                if let Some(x) = protocol.last_encoding_result()
-                    && let Err(e) = x
+                // Search in the background: the TUI keeps rendering and
+                // stays responsive while rustypipe works.
+                if search_task.is_none()
+                    && let Some(api) = self.api
                 {
-                    panic!("Error with last encoding result for image '{e}'");
+                    debug!(query = %popup_query, ?api, "popup: spawning background search");
+                    videos_list.clear();
+                    selected_list_item.select(None);
+                    search_error.take();
+                    let query = popup_query.clone();
+                    *search_task = Some(tokio::spawn(Self::run_search(api, query)));
                 }
             }
-
-            // Bottom Panel
-            let info_layout = layout[1];
-            let info_layout = info_layout.centered_horizontally(Constraint::Percentage(50));
-            if open_popup {
-                self.render_yt_search_popup(
-                    videos_list,
-                    selected_list_item,
-                    popup_query,
-                    f,
-                    info_layout,
-                );
-            } else {
-                self.render_yt_player(
-                    response,
-                    playback_time,
-                    f,
-                    info_layout,
-                    file,
-                    empty_player,
-                    mpv_vol,
-                );
-            }
-        } else {
-            // Vid not started
-            if Utc::now().second().is_multiple_of(2) {
-                *loader_idx = loader_idx.saturating_add(1) % loader.len();
-            }
-            Block::bordered()
-                .title(format!("[Loading MPV {}]", loader[*loader_idx]))
-                .render(f.area(), f.buffer_mut());
         }
-    }
-
-    fn render_yt_search_popup(
-        &mut self,
-        videos_list: &[(String, YoutubeResponse)],
-        selected_list_item: &mut ListState,
-        popup_query: &String,
-        f: &mut Frame<'_>,
-        info_layout: Rect,
-    ) {
-        // Popup for yt search
-        let areas =
-            Layout::vertical([Constraint::Length(3), Constraint::Fill(3)]).split(info_layout);
-        Paragraph::new(format!("YTSearch: {popup_query}"))
-            .block(
-                Block::bordered()
-                    .title_top("Search")
-                    .title_alignment(HorizontalAlignment::Center)
-                    .yellow()
-                    .on_blue(),
-            )
-            .render(areas[0], f.buffer_mut());
-        let list = List::new(
-            videos_list
-                .iter()
-                .map(|v| ListItem::from(v.0.clone()))
-                .collect::<Vec<ListItem>>(),
-        )
-        .block(
-            Block::bordered()
-                .title_bottom(
-                    format!("[▼▲ Select Entry | (Esc) Player | (Enter) Search/Play Entry | Tab Change Api: {}]",self.api.unwrap_or_default()),
-                )
-                .style(Style::default().yellow().on_blue()),
-        )
-        .highlight_symbol(">")
-        .highlight_style(Style::default().red().on_cyan())
-        .direction(ratatui::widgets::ListDirection::TopToBottom);
-        f.render_stateful_widget(list, areas[1], selected_list_item);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_yt_player(
-        &mut self,
-        response: &mut Option<YoutubeResponse>,
-        playback_time: f64,
-        f: &mut Frame<'_>,
-        info_layout: Rect,
-        file: &mut Option<(TaggedFile, String)>,
-        empty_player: bool,
-        mpv_vol: &f64,
-    ) {
-        // Playback Info When Audio is from Youtube
-        if let Some(res) = response {
-            Block::bordered()
-                .style(Style::default().on_blue().yellow())
-                .title_top(format!(
-                    "{} - {}:{}",
-                    res.get_name(),
-                    format_time(playback_time as u32),
-                    format_time(res.get_duration()),
-                ))
-                .title_alignment(HorizontalAlignment::Center)
-                .title_top(format!("[Vol:{mpv_vol}]"))
-                .title_alignment(HorizontalAlignment::Right)
-                .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek | 'y' Yank URL |'o' YtSearch]")
-                .title_alignment(HorizontalAlignment::Center)
-                .render(info_layout, f.buffer_mut());
-            let gauge_layout = info_layout
-                .inner(Margin {
-                    horizontal: 1,
-                    vertical: 1,
-                })
-                .centered_vertically(Constraint::Percentage(50));
-            Gauge::default()
-                .block(Block::bordered().style(Style::default().yellow().on_blue()))
-                .ratio(playback_time / res.get_duration() as f64)
-                .render(gauge_layout, f.buffer_mut());
-        } else if let Some(file) = file {
-            Block::bordered()
-                .style(Style::default().yellow().on_blue())
-                .title_top(format!(
-                    "{} - {}:{}",
-                    PathBuf::from(&file.1)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    format_time(playback_time as u32),
-                    format_time(file.0.properties().duration().as_secs() as u32),
-                ))
-                .title_alignment(HorizontalAlignment::Center)
-                .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek]")
-                .title_alignment(HorizontalAlignment::Center)
-                .render(info_layout, f.buffer_mut());
-            let gauge_layout = info_layout
-                .inner(Margin {
-                    horizontal: 1,
-                    vertical: 1,
-                })
-                .centered_vertically(Constraint::Percentage(50));
-
-            Gauge::default()
-                .block(Block::bordered().style(Style::default().yellow().on_blue()))
-                .ratio(playback_time / file.0.properties().duration().as_secs_f64())
-                .render(gauge_layout, f.buffer_mut());
-        } else if empty_player {
-            Block::bordered()
-                .style(Style::default().on_blue().yellow())
-                .title_alignment(HorizontalAlignment::Center)
-                .title_bottom("['q' Quit | ▲▼ Volume(+/-) | ◀▶ Seek | 'y' Yank URL |'o' YtSearch]")
-                .title_alignment(HorizontalAlignment::Center)
-                .render(info_layout, f.buffer_mut());
-            let gauge_layout = info_layout
-                .inner(Margin {
-                    horizontal: 1,
-                    vertical: 1,
-                })
-                .centered_vertically(Constraint::Percentage(50));
-            Gauge::default()
-                .block(Block::bordered().style(Style::default().yellow().on_blue()))
-                .ratio(playback_time / 1.0)
-                .render(gauge_layout, f.buffer_mut());
+        // `p` appends the picked result to the playlist (a typed `p`
+        // still goes to the query above when nothing is picked).
+        // The first entry starts playing right away.
+        if event.is_key_press()
+            && event.as_key_event().unwrap().code == KeyCode::Char('p')
+            && let Some(vid) = picked
+        {
+            let first = playlist.is_empty();
+            playlist.add(PlaylistItem::Stream(vid.clone()));
+            debug!(first, "popup: added entry to playlist");
+            if first {
+                Self::play_stream(response, mpv, img, &self.args, vid, audio_only, picker)
+                    .await;
+                videos_list.clear();
+                selected_list_item.select(None);
+                *open_popup = false;
+            }
         }
     }
 
@@ -1189,16 +1296,17 @@ impl YoutubeRs {
         format!("https://www.youtube.com/watch?v={}", video_id.into())
     }
     fn cleanup_rustypipe_cache() {
-        std::fs::remove_file("./rustypipe_cache.json").expect("Could not clean cache");
+        // Missing file is fine (e.g. search failed before writing it).
+        let _ = std::fs::remove_file("./rustypipe_cache.json");
     }
 
     async fn fetch_yt_thumbnail(video_id: &str, args: &Cli) -> Result<DynamicImage> {
         let thumbnail_url = if Self::ytdlp_exist(args) {
             Self::fetch_video_info(args, video_id)
                 .await
-                .expect("Could not get fetcher")
+                .context("Could not get fetcher")?
                 .thumbnail
-                .unwrap()
+                .context("Could not get thumbnail")?
         } else {
             format!("https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
         };
@@ -1211,14 +1319,24 @@ impl YoutubeRs {
         Ok(image::load_from_memory(&thumbnail_bytes)?)
     }
 
+    /// Load a YouTube thumbnail and convert it to a ratatui-image protocol, or None on failure.
+    async fn load_thumbnail(
+        args: &Cli,
+        video_id: &str,
+        picker: Option<&picker::Picker>,
+    ) -> Option<ratatui_image::protocol::StatefulProtocol> {
+        let dyn_img = Self::fetch_yt_thumbnail(video_id, args).await.ok()?;
+        let picker = picker?;
+        Some(picker.new_resize_protocol(dyn_img))
+    }
+
     async fn download_audio(
-        &self,
         video_id: impl std::fmt::Display,
         video_name: &str,
         format: AudioFormat,
         args: &Cli,
     ) -> Result<()> {
-        println!("Downloading Audio ...");
+        info!(video_id = %video_id, video_name = %video_name, ?format, "download_audio: starting");
         let safe_name =
             video_name.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
         let vid_info = Self::fetch_video_info(args, video_id.to_string().as_str())
@@ -1227,7 +1345,7 @@ impl YoutubeRs {
         let fetcher = Self::get_downloader(args).await?;
         let downloaded = fetcher
             .download_audio_stream_with_quality(
-                Self::get_video_url(video_id.to_string()),
+                &vid_info,
                 format!("{safe_name}.{}", format.to_string().to_lowercase()),
                 yt_dlp::model::AudioQuality::Best,
                 yt_dlp::model::AudioCodecPreference::Custom(format.to_string()),
@@ -1270,19 +1388,21 @@ impl YoutubeRs {
     }
 
     async fn download_video(
-        &self,
         video_id: impl std::fmt::Display,
         video_name: &str,
         format: VideoFormat,
         args: &Cli,
     ) -> Result<()> {
-        println!("Downloading Video ...");
+        info!(video_id = %video_id, video_name = %video_name, ?format, "download_video: starting");
         let fetcher = Self::get_downloader(args).await?;
         let safe_name =
             video_name.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
+        let video_info = fetcher
+            .fetch_video_infos(Self::get_video_url(video_id.to_string()))
+            .await?;
         let downloaded = fetcher
             .download_video_with_quality(
-                Self::get_video_url(video_id.to_string()),
+                &video_info,
                 format!("{safe_name}.{}", format.to_string().to_lowercase()),
                 yt_dlp::model::VideoQuality::Best,
                 VideoCodecPreference::Custom(format.to_string()),
@@ -1295,6 +1415,7 @@ impl YoutubeRs {
     }
 
     async fn download_transcript(&self, video_id: &str, args: &Cli) -> Result<()> {
+        info!(?video_id, "download_transcript: starting");
         let fetcher = Self::get_downloader(args).await?;
 
         let url = format!("https://www.youtube.com/watch?v={video_id}");
@@ -1315,17 +1436,12 @@ impl YoutubeRs {
                 }
                 return Ok(());
             }
-            let lang = match inquire::Select::new(
+            let lang = match crate::bootstrap::prompt_select(
                 "Generated Lang",
-                cap.iter().map(|(lang, _)| lang.clone()).collect(),
-            )
-            .prompt()
-            {
-                Ok(l) => l,
-                Err(e) => match e {
-                    inquire::InquireError::OperationCanceled => Err(anyhow!(YtrsError::Quit))?,
-                    _ => Err(e)?,
-                },
+                &cap.iter().map(|(lang, _)| lang.clone()).collect::<Vec<_>>(),
+            )? {
+                Some(idx) => cap[idx].0.clone(),
+                None => Err(anyhow!(YtrsError::Quit))?,
             };
             for (l, cap) in cap {
                 if lang == l {
@@ -1333,14 +1449,15 @@ impl YoutubeRs {
                         .iter()
                         .map(|v| Subtitle::from_automatic_caption(v, l.clone()))
                         .collect();
-                    let res_to_dl = match inquire::Select::new("Caption", res).prompt() {
-                        Ok(res) => res,
-                        Err(e) => match e {
-                            inquire::InquireError::OperationCanceled => {
-                                Err(anyhow!(YtrsError::Quit))?
-                            }
-                            _ => Err(e)?,
-                        },
+                    let res_to_dl = match crate::bootstrap::prompt_select(
+                        "Caption",
+                        &res
+                            .iter()
+                            .map(|s| format!("{} [{}]", s.url, s.file_extension()))
+                            .collect::<Vec<_>>(),
+                    )? {
+                        Some(idx) => res[idx].clone(),
+                        None => Err(anyhow!(YtrsError::Quit))?,
                     };
                     let response = reqwest::Client::new()
                         .get(res_to_dl.url.clone())
@@ -1364,18 +1481,7 @@ impl YoutubeRs {
                         println!("Summarize : {b}");
                         b
                     } else {
-                        match inquire::Confirm::new("Summarize with ai ?")
-                            .with_starting_input("N")
-                            .prompt()
-                        {
-                            Ok(b) => b,
-                            Err(e) => match e {
-                                inquire::InquireError::OperationCanceled => {
-                                    Err(anyhow!(YtrsError::Quit))?
-                                }
-                                _ => Err(e)?,
-                            },
-                        }
+                        crate::bootstrap::prompt_confirm("Summarize with ai ?", false)?
                     };
                     if res {
                         use tokio::io::{self, AsyncWriteExt};
@@ -1383,19 +1489,12 @@ impl YoutubeRs {
 
                         let ollama = Ollama::default();
                         let models = ollama.list_local_models().await?;
-                        let model = match inquire::Select::new(
+                        let model = match crate::bootstrap::prompt_select(
                             "Which LLM to use:",
-                            models.iter().map(|llm| llm.name.clone()).collect(),
-                        )
-                        .prompt()
-                        {
-                            Ok(v) => v,
-                            Err(e) => match e {
-                                inquire::InquireError::OperationCanceled => {
-                                    Err(anyhow!(YtrsError::Quit))?
-                                }
-                                _ => Err(e)?,
-                            },
+                            &models.iter().map(|llm| llm.name.clone()).collect::<Vec<_>>(),
+                        )? {
+                            Some(idx) => models[idx].name.clone(),
+                            None => Err(anyhow!(YtrsError::Quit))?,
                         };
                         println!("Generating response ...\n");
                         let mut stream = ollama.generate_stream(GenerationRequest::new(
@@ -1418,12 +1517,9 @@ impl YoutubeRs {
         }
         println!("Finding Subtitles");
 
-        let selected_lang = match inquire::Select::new("Lang", languages).prompt() {
-            Ok(v) => v,
-            Err(e) => match e {
-                inquire::InquireError::OperationCanceled => Err(anyhow!(YtrsError::Quit))?,
-                _ => Err(e)?,
-            },
+        let selected_lang = match crate::bootstrap::prompt_select("Lang", &languages)? {
+            Some(idx) => languages[idx].clone(),
+            None => Err(anyhow!(YtrsError::Quit))?,
         };
         // Download English subtitles
         let subtitle_path = fetcher
@@ -1431,6 +1527,7 @@ impl YoutubeRs {
                 &video,
                 selected_lang.clone(),
                 format!("subtitle_{selected_lang}.srt"),
+                true,
             )
             .await?;
         println!("Subtitle downloaded to: {:?}", subtitle_path);
@@ -1438,117 +1535,142 @@ impl YoutubeRs {
         Ok(())
     }
 
-    fn yt_prompt(opt_search: Option<String>) -> Result<String> {
-        InquireText::new("Youtube Search:")
-            .with_help_message("Press Escape to cancel | Ctrl+C to exit")
-            .with_initial_value(&opt_search.unwrap_or_default())
-            .with_validator(|input: &str| {
-                if input.trim().is_empty() {
-                    Ok(Validation::Invalid("Search term cannot be empty".into()))
-                } else if input.len() < 2 {
-                    Ok(Validation::Invalid(
-                        "Search term too short (min 2 characters)".into(),
-                    ))
-                } else {
-                    Ok(Validation::Valid)
-                }
-            })
-            .prompt()
-            .context("Failed to read search input")
-    }
-
-    async fn query_ytmusic(opt_search: Option<String>) -> Result<(TrackItem, String)> {
-        let search_term = Self::yt_prompt(opt_search)?;
-        let rp = RustyPipe::new();
-        let found_videos = rp
+    async fn search_tracks(term: &str) -> Result<Vec<TrackItem>> {
+        debug!(?term, "search_tracks: searching YouTube Music");
+        let found = RustyPipe::new()
             .query()
             .unauthenticated()
-            .music_search_tracks(search_term.clone())
+            .music_search_tracks(term.to_string())
             .await
             .context("Failed to search YouTube Music")?;
         Self::cleanup_rustypipe_cache();
-        let mut found_videos_str: Vec<String> = found_videos
-            .clone()
-            .items
-            .items
-            .into_iter()
-            .map(|track| TrackInfo::from(&track).colored())
-            .collect();
-        found_videos_str.push("Exit".red().to_string());
-        let selected_vid_str = Select::new("Select Music", found_videos_str)
-            .prompt()
-            .context("Failed to select music")?;
-        if selected_vid_str == "Exit".red().to_string().as_str() {
-            let confirm = Confirm::new("Exit application?")
-                .with_default(true)
-                .prompt()?;
-            if confirm {
-                bail!("User cancelled");
-            }
-        }
-        if let Some(vid) = found_videos
-            .items
-            .items
-            .into_iter()
-            .find(|track| TrackInfo::from(track).colored() == selected_vid_str)
-        {
-            Ok((vid, search_term))
-        } else {
-            bail!("Selected music not found. Please try again.");
-        }
+        debug!(count = found.items.items.len(), "search_tracks: results received");
+        Ok(found.items.items)
     }
-    async fn query_ytvideo(opt_search: Option<String>) -> Result<(VideoItem, String)> {
-        let search_term = Self::yt_prompt(opt_search.clone())?;
-        let found_videos: rustypipe::model::SearchResult<VideoItem> = RustyPipe::new()
+
+    async fn search_videos(term: &str) -> Result<Vec<VideoItem>> {
+        debug!(?term, "search_videos: searching YouTube");
+        let found: rustypipe::model::SearchResult<VideoItem> = RustyPipe::new()
             .query()
             .unauthenticated()
-            .search(search_term.clone())
+            .search(term.to_string())
             .await
             .context("Failed to search YouTube")?;
         Self::cleanup_rustypipe_cache();
-        if found_videos.items.items.len() == 1
-            && let Some(item) = found_videos.items.items.first()
-        {
-            return Ok((item.clone(), opt_search.clone().unwrap_or_default()));
-        }
-        let mut videos: Vec<String> = found_videos
-            .items
-            .items
-            .iter()
-            .map(|v: &VideoItem| VideoInfo::from(v).colored())
-            .collect();
-        videos.push("Exit".red().to_string());
+        debug!(count = found.items.items.len(), "search_videos: results received");
+        Ok(found.items.items)
+    }
 
-        let video_entry = Select::new("Select video to watch", videos)
-            .with_help_message("Type to filter | Arrow keys to navigate | Enter to select")
-            .prompt()
-            .context("Failed to select video")?;
-        if video_entry == "Exit".red().to_string().as_str() {
-            let confirm = Confirm::new("Exit application?")
-                .with_default(true)
-                .prompt()?;
-            if confirm {
-                bail!("User cancelled");
+    /// Resolve a search term (or URL) to `(video_id, display_name)`.
+    /// URLs auto-match their id against the results, single results are
+    /// taken directly, otherwise a numbered stdin pick replaces the old
+    /// inquire selection.
+    async fn pick_media(&self, term: &str) -> Result<(String, String)> {
+        use crate::bootstrap::prompt_select;
+
+        let wanted_id = extract_video_id(term);
+        match self.api {
+            Some(YoutubeAPI::Music) => {
+                let items = Self::search_tracks(term).await?;
+                if items.is_empty() {
+                    bail!("No results for '{term}'");
+                }
+                if let Some(id) = wanted_id {
+                    return items
+                        .iter()
+                        .find(|t| t.id == id)
+                        .map(|t| (t.id.clone(), t.name.clone()))
+                        .context("URL video not found in search results");
+                }
+                if items.len() == 1 {
+                    let t = &items[0];
+                    return Ok((t.id.clone(), t.name.clone()));
+                }
+                let labels: Vec<String> =
+                    items.iter().map(|t| TrackInfo::from(t).colored()).collect();
+                match prompt_select("Select Music", &labels)? {
+                    Some(idx) => {
+                        let t = &items[idx];
+                        Ok((t.id.clone(), t.name.clone()))
+                    }
+                    None => bail!("User cancelled"),
+                }
+            }
+            _ => {
+                let items = Self::search_videos(term).await?;
+                if items.is_empty() {
+                    bail!("No results for '{term}'");
+                }
+                if let Some(id) = wanted_id {
+                    return items
+                        .iter()
+                        .find(|v| v.id == id)
+                        .map(|v| (v.id.clone(), v.name.clone()))
+                        .context("URL video not found in search results");
+                }
+                if items.len() == 1 {
+                    let v = &items[0];
+                    return Ok((v.id.clone(), v.name.clone()));
+                }
+                let labels: Vec<String> =
+                    items.iter().map(|v| VideoInfo::from(v).colored()).collect();
+                match prompt_select("Select video", &labels)? {
+                    Some(idx) => {
+                        let v = &items[idx];
+                        Ok((v.id.clone(), v.name.clone()))
+                    }
+                    None => bail!("User cancelled"),
+                }
             }
         }
-        let selected_vid = found_videos
-            .items
-            .items
-            .into_iter()
-            .find(|v| VideoInfo::from(v).colored() == video_entry);
-        if let Some(vid) = selected_vid {
-            Ok((vid, search_term))
-        } else {
-            bail!("Selected video not found. Please try again.");
+    }
+
+    /// Resolve a `--url` straight to a response (no prompt): match the
+    /// extracted id against search results. `Ok(None)` opens the empty hub.
+    async fn match_url_response(&self, url: &str) -> Result<Option<YoutubeResponse>> {
+        let Some(id) = extract_video_id(url) else {
+            warn!("match_url_response: no video id in URL, opening empty hub");
+            return Ok(None);
+        };
+        debug!(?id, "match_url_response: resolving URL");
+        match self.api {
+            Some(YoutubeAPI::Music) => match Self::search_tracks(&id).await {
+                Ok(items) => Ok(items
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .map(YoutubeResponse::Track)),
+                Err(e) => {
+                    warn!(?e, "match_url_response: music lookup failed");
+                    Ok(None)
+                }
+            },
+            _ => match Self::search_videos(&id).await {
+                Ok(items) => Ok(items
+                    .into_iter()
+                    .find(|v| v.id == id)
+                    .map(YoutubeResponse::Video)),
+                Err(e) => {
+                    warn!(?e, "match_url_response: video lookup failed");
+                    Ok(None)
+                }
+            },
         }
     }
     pub fn check_mpv() -> Result<bool> {
+        debug!("check_mpv: running mpv --version");
         let output = std::process::Command::new("mpv")
             .args(["--version"])
             .output();
         match output {
-            Ok(output) => Ok(output.status.success()),
-            Err(_) => Err(YtrsError::MpvNotFound.into()),
+            Ok(output) => {
+                let success = output.status.success();
+                debug!(success, "check_mpv: result");
+                Ok(success)
+            }
+            Err(e) => {
+                error!(?e, "check_mpv: mpv not found");
+                Err(YtrsError::MpvNotFound.into())
+            }
         }
     }
     fn ytdlp_exist(args: &Cli) -> bool {
@@ -1573,26 +1695,31 @@ impl YoutubeRs {
             Self::get_libs(args).ffmpeg.exists()
         }
     }
-    fn libraries_exist(&mut self, args: &Cli) -> bool {
-        if !Self::ytdlp_exist(args) {
-            println!(
-                "YT-DLP not found at '{}'",
-                Self::get_libs(args).youtube.to_string_lossy()
+    fn libraries_exist(args: &Cli) -> bool {
+        let ytdlp = Self::ytdlp_exist(args);
+        let ffmpeg = Self::ffmpeg_check(args);
+        if !ytdlp {
+            warn!(
+                path = %Self::get_libs(args).youtube.to_string_lossy(),
+                "libraries_exist: yt-dlp not found"
             );
         }
-        if !Self::ffmpeg_check(args) {
-            println!(
-                "FFMPEG not found at '{}'",
-                Self::get_libs(args).ffmpeg.to_string_lossy()
+        if !ffmpeg {
+            warn!(
+                path = %Self::get_libs(args).ffmpeg.to_string_lossy(),
+                "libraries_exist: ffmpeg not found"
             );
         }
-        Self::ytdlp_exist(args) && Self::ffmpeg_check(args)
+        debug!(ytdlp, ffmpeg, "libraries_exist: check result");
+        ytdlp && ffmpeg
     }
 
     async fn install_lib(args: &Cli) -> Result<()> {
-        println!("Installing Libraries");
+        info!("install_lib: installing yt-dlp and ffmpeg");
         let (exec_dir, _) = Self::get_libs_path(args);
+        debug!(?exec_dir, "install_lib: target directory");
         install_libraries!(exec_dir)?;
+        info!("install_lib: done");
         Ok(())
     }
     #[cfg(target_os = "windows")]
@@ -1699,31 +1826,103 @@ impl YoutubeRs {
     async fn get_downloader(args: &Cli) -> Result<Downloader> {
         let (_, out) = Self::get_libs_path(args);
         let libs = Self::get_libs(args);
-        Downloader::new(libs, out)
+        Downloader::builder(libs, out)
+            .build()
             .await
             .context("Failed to retrieve Youtube Fetcher")
+    }
+    pub async fn update_yt_dlp(args: &Cli) -> Result<()> {
+        let (libs, out) = Self::get_libs_path(args);
+        let libraries = Libraries::new(libs.join("yt-dlp"), libs.join("ffmpeg"));
+        let dl = Downloader::builder(libraries, out).build().await?;
+        dl.update_downloader().await?;
+        Ok(())
     }
     async fn fetch_video_info(args: &Cli, video_id: &str) -> Option<Video> {
         let (libs, out) = Self::get_libs_path(args);
         let libraries = Libraries::new(libs.join("yt-dlp"), libs.join("ffmpeg"));
-        if let Ok(x) = yt_dlp::Downloader::new(libraries, out).await {
+        if let Ok(x) = yt_dlp::Downloader::builder(libraries, out).build().await {
             if let Ok(x) = x.fetch_video_infos(Self::get_video_url(video_id)).await {
                 return Some(x);
             }
         }
         None
     }
+    fn get_stream_url(video: &Video, audio_only: bool) -> Option<String> {
+        video
+            .formats
+            .iter()
+            .filter(|f| {
+                if audio_only {
+                    f.is_audio() && !f.is_video()
+                } else {
+                    f.is_audio() && f.is_video()
+                }
+            })
+            .filter_map(|f| f.url().ok().cloned())
+            .next()
+    }
+
+    /// Resolve the best playback URL for a video: try yt-dlp stream URL first, fall back to page URL.
+    async fn resolve_stream_url(args: &Cli, video_id: &str, audio_only: bool) -> String {
+        let stream_url = Self::fetch_video_info(args, video_id)
+            .await
+            .and_then(|video| Self::get_stream_url(&video, audio_only));
+        match stream_url {
+            Some(url) => url,
+            None => Self::get_video_url(video_id),
+        }
+    }
+    /// Play the entry queued after what's currently playing (wraparound,
+    /// forever). Only when the current track/ file is itself queued.
+    /// Returns true when something was loaded.
+    #[allow(clippy::too_many_arguments)]
+    async fn play_next_queued(
+        response: &mut Option<YoutubeResponse>,
+        file: &mut Option<(TaggedFile, String)>,
+        mpv: &mut MpvIpc,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        args: &Cli,
+        playlist: &mut Playlist,
+        audio_only: bool,
+        picker: Option<&picker::Picker>,
+    ) -> bool {
+        let current_key: Option<String> = response
+            .as_ref()
+            .map(|r| r.get_id())
+            .or_else(|| file.as_ref().map(|f| PlaylistItem::file_id(&f.1)));
+        if let Some(key) = current_key
+            && let Some(pos) = playlist.index_of(&key)
+            && let Some(item) = playlist.get((pos + 1) % playlist.len()).cloned()
+        {
+            Self::play_item(response, file, mpv, img, args, item, audio_only, picker).await;
+            true
+        } else {
+            false
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_playback_event(
         &mut self,
         response: &mut Option<YoutubeResponse>,
+        file: &mut Option<(TaggedFile, String)>,
         mpv: &mut MpvIpc,
         pause_state: &mut bool,
         open_popup: &mut bool,
         event: ratatui::crossterm::event::Event,
         empty_player: bool,
-        conn_out: &mut Option<MidiOutputConnection>,
+        midi: &mut MidiRuntime,
         mpv_vol: &f64,
+        sidebar: &mut Sidebar,
+        output_dir: &Path,
+        transcript: &mut ui::TranscriptState,
+        setup: &mut ui::SetupState,
+        audio_device_names: &mut Vec<String>,
+        playlist: &mut Playlist,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        audio_only: bool,
+        picker: Option<&picker::Picker>,
     ) -> ControlFlow<()> {
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('q') {
             return ControlFlow::Break(());
@@ -1735,6 +1934,43 @@ impl YoutubeRs {
             let current_url = Self::get_video_url(&res.get_id());
             let _ = Self::clipboard(&current_url);
         }
+        // Download the current stream in the background (player format).
+        // The file shows up in the download sidebar once finished.
+        if event.is_key_press()
+            && event.as_key_event().unwrap().code == KeyCode::Char('d')
+            && let Some(res) = response
+        {
+            let video_id = res.get_id();
+            let video_name = res.get_name();
+            let format = match self.action {
+                AppAction::Player { format } | AppAction::Download { format } => format,
+                _ => Format::Audio {
+                    format: AudioFormat::MP3,
+                },
+            };
+            let args = self.args.clone();
+            info!(?video_id, ?format, "player: background download started");
+            tokio::spawn(async move {
+                if !YoutubeRs::libraries_exist(&args)
+                    && let Err(e) = YoutubeRs::install_lib(&args).await
+                {
+                    error!(?e, "player: background download lib install failed");
+                    return;
+                }
+                let outcome = match format {
+                    Format::Audio { format } => {
+                        YoutubeRs::download_audio(video_id, &video_name, format, &args).await
+                    }
+                    Format::Video { format } => {
+                        YoutubeRs::download_video(&video_id, &video_name, format, &args).await
+                    }
+                };
+                match outcome {
+                    Ok(()) => info!("player: background download finished"),
+                    Err(e) => error!(?e, "player: background download failed"),
+                }
+            });
+        }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char(' ') {
             *pause_state = !*pause_state;
             let _ = mpv.set_prop("pause", pause_state).await;
@@ -1745,26 +1981,714 @@ impl YoutubeRs {
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Left {
             let _ = mpv.send_command(json!(["seek", "-5", "relative"])).await;
         }
+        if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Home {
+            let _ = mpv.send_command(json!(["seek", 0, "absolute"])).await;
+        }
+        if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::End
+            && !Self::play_next_queued(
+                response,
+                file,
+                mpv,
+                img,
+                &self.args,
+                playlist,
+                audio_only,
+                picker,
+            )
+            .await
+        {
+            // Nothing queued after this track: stop playback.
+            let _ = mpv.send_command(json!(["stop"])).await;
+        }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Up {
             let _ = mpv.send_command(json!(["add", "volume", "5"])).await;
-            if let Some(out_midi_connection) = conn_out {
+            if let Some(out_midi_connection) = &mut midi.conn_out {
                 let _ = out_midi_connection.send(&[224, 0, u32_to_midi(*mpv_vol as u32)]);
             }
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Down {
             let _ = mpv.send_command(json!(["add", "volume", "-5"])).await;
-            if let Some(out_midi_connection) = conn_out {
+            if let Some(out_midi_connection) = &mut midi.conn_out {
                 let _ = out_midi_connection.send(&[224, 0, u32_to_midi(*mpv_vol as u32)]);
             }
+        }
+        if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('D') {
+            sidebar.toggle(output_dir);
         }
         if (response.is_some() | empty_player)
             && event.is_key_press()
             && event.as_key_event().unwrap().code == KeyCode::Char('o')
         {
+            if self.api.is_none() {
+                self.api = Some(YoutubeAPI::Video);
+            }
             *open_popup = !*open_popup;
+        }
+        // Playlist sidebar (play queue).
+        if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('P') {
+            playlist.toggle();
+        }
+        // Transcript menu for the current stream: pick a track first.
+        if event.is_key_press()
+            && event.as_key_event().unwrap().code == KeyCode::Char('t')
+            && let Some(res) = response
+        {
+            let video_id = res.get_id();
+            transcript.open = true;
+            transcript.title = res.get_name();
+            transcript.picking = true;
+            transcript.filter.clear();
+            transcript.filtering = false;
+            transcript.sel = 0;
+            transcript.lines.clear();
+            transcript.summary.clear();
+            transcript.selected = None;
+            transcript.list_error.clear();
+            match Self::list_transcript_tracks(&video_id, &self.args).await {
+                Ok(tracks) => {
+                    if tracks.is_empty() {
+                        transcript.list_error =
+                            "No transcripts available for this video".to_string();
+                    } else {
+                        transcript.tracks = tracks;
+                    }
+                }
+                Err(e) => {
+                    transcript.list_error = format!("Transcript list failed: {e:#}");
+                }
+            }
+        }
+        // Setup menu: MIDI ports + mpv audio output + playback mode.
+        if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('e') {
+            setup.open = true;
+            Self::refresh_setup(setup, mpv, audio_device_names, audio_only).await;
         }
         ControlFlow::Continue(())
     }
+
+    /// Handle key events when the playlist sidebar is open.
+    /// `j/k` select, `d` removes, `Shift+J/K` reorders, `Enter` plays, `Esc` closes.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_playlist_event(
+        playlist: &mut Playlist,
+        response: &mut Option<YoutubeResponse>,
+        file: &mut Option<(TaggedFile, String)>,
+        mpv: &mut MpvIpc,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        audio_only: bool,
+        picker: Option<&picker::Picker>,
+        args: &Cli,
+        event: &ratatui::crossterm::event::Event,
+    ) {
+        if !event.is_key_press() {
+            return;
+        }
+        match event.as_key_event().unwrap().code {
+            KeyCode::Esc | KeyCode::Char('P') => {
+                playlist.toggle();
+            }
+            KeyCode::Up | KeyCode::Char('k') => playlist.select_prev(),
+            KeyCode::Down | KeyCode::Char('j') => playlist.select_next(),
+            KeyCode::Char('K') => playlist.move_selected(-1),
+            KeyCode::Char('J') => playlist.move_selected(1),
+            KeyCode::Char('d') => playlist.remove_selected(),
+            KeyCode::Enter => {
+                if let Some(item) = playlist.current().cloned() {
+                    Self::play_item(response, file, mpv, img, args, item, audio_only, picker)
+                        .await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle key events when the sidebar is open.
+    /// `Enter` loads the selected file into the player, `p` appends it to
+    /// the playlist (autoplay when first). Transcript files open in the
+    /// transcript view instead of playing.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_sidebar_event(
+        &mut self,
+        sidebar: &mut Sidebar,
+        mpv: &mut MpvIpc,
+        output_dir: &Path,
+        response: &mut Option<YoutubeResponse>,
+        file: &mut Option<(TaggedFile, String)>,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        picker: Option<&picker::Picker>,
+        playlist: &mut Playlist,
+        transcript: &mut ui::TranscriptState,
+        event: &ratatui::crossterm::event::Event,
+    ) {
+        if !event.is_key_press() {
+            return;
+        }
+        match event.as_key_event().unwrap().code {
+            KeyCode::Esc | KeyCode::Char('D') => {
+                if sidebar.confirm_delete {
+                    sidebar.confirm_delete = false;
+                } else {
+                    sidebar.open = false;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                sidebar.up();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                sidebar.down();
+            }
+            KeyCode::Enter => {
+                if let Some(path) = sidebar.selected() {
+                    if is_transcript_file(path) {
+                        Self::open_transcript_file(transcript, path);
+                        sidebar.open = false;
+                    } else {
+                        let path_str = path.to_string_lossy().to_string();
+                        self.last_search = Some(path_str.clone());
+                        Self::play_file(response, file, mpv, img, path_str, picker).await;
+                        sidebar.open = false;
+                    }
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(path) = sidebar.selected() {
+                    let path_str = path.to_string_lossy().to_string();
+                    if Self::probe_file(Path::new(&path_str)).is_some() {
+                        let first = playlist.is_empty();
+                        playlist.add(PlaylistItem::File(path_str.clone()));
+                        debug!(path = %path_str, first, "sidebar: added file to playlist");
+                        if first {
+                            self.last_search = Some(path_str.clone());
+                            Self::play_file(response, file, mpv, img, path_str, picker)
+                                .await;
+                            sidebar.open = false;
+                        }
+                    } else {
+                        warn!(path = %path_str, "sidebar: unreadable file, not queued");
+                    }
+                }
+            }
+            KeyCode::Char('r') => {
+                sidebar.refresh(output_dir);
+            }
+            KeyCode::Char('d') => {
+                if sidebar.selected().is_some() {
+                    sidebar.confirm_delete = true;
+                }
+            }
+            KeyCode::Char('y') => {
+                if sidebar.confirm_delete {
+                    sidebar.confirm_delete = false;
+                    if let Some(path) = sidebar.selected() {
+                        let path_str = path.to_string_lossy().to_string();
+                        match std::fs::remove_file(path) {
+                            Ok(()) => {
+                                debug!(path = %path_str, "sidebar: deleted file");
+                                sidebar.refresh(output_dir);
+                            }
+                            Err(e) => error!(?e, path = %path_str, "sidebar: delete failed"),
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                sidebar.confirm_delete = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle key events when the transcript menu is open.
+    /// Picking level: choose a track (`/` filters). Reading level: scroll,
+    /// reload and summarize. `Esc` goes back a level.
+    async fn handle_transcript_event(
+        transcript: &mut ui::TranscriptState,
+        response: &Option<YoutubeResponse>,
+        args: &Cli,
+        event: &ratatui::crossterm::event::Event,
+    ) {
+        if !event.is_key_press() {
+            return;
+        }
+        if transcript.picking {
+            Self::handle_transcript_pick(transcript, response, args, event).await;
+            return;
+        }
+        match event.as_key_event().unwrap().code {
+            KeyCode::Esc => {
+                transcript.picking = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                transcript.scroll = transcript.scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = transcript.lines.len().saturating_sub(1);
+                transcript.scroll = (transcript.scroll + 1).min(max);
+            }
+            KeyCode::Home => {
+                transcript.scroll = 0;
+            }
+            KeyCode::End => {
+                transcript.scroll = transcript.lines.len().saturating_sub(1);
+            }
+            // Retry loading the selected track.
+            KeyCode::Char('r') => {
+                if let Some(track) = transcript.selected.clone()
+                    && let Some(res) = response
+                {
+                    Self::load_transcript_track(transcript, &res.get_id(), args, &track)
+                        .await;
+                }
+            }
+            // Summarize the loaded script with the first local Ollama model.
+            KeyCode::Char('s') => {
+                if transcript.summary.is_empty() && !transcript.lines.is_empty() {
+                    match Self::summarize_lines(&transcript.lines).await {
+                        Ok((model, text)) => {
+                            let mut out = vec![format!("Model: {model}")];
+                            out.extend(text.lines().map(str::to_string));
+                            transcript.summary = out;
+                        }
+                        Err(e) => {
+                            transcript.summary =
+                                vec![format!("Summarize failed (Ollama?): {e:#}")];
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Picking level of the transcript menu: navigate, `/`-filter, load.
+    async fn handle_transcript_pick(
+        transcript: &mut ui::TranscriptState,
+        response: &Option<YoutubeResponse>,
+        args: &Cli,
+        event: &ratatui::crossterm::event::Event,
+    ) {
+        let visible_len = transcript.visible_tracks().len();
+        let max_sel = visible_len.saturating_sub(1);
+        transcript.sel = transcript.sel.min(max_sel);
+        match event.as_key_event().unwrap().code {
+            KeyCode::Esc => {
+                if transcript.filtering {
+                    transcript.filtering = false;
+                } else {
+                    transcript.open = false;
+                }
+            }
+            KeyCode::Char('/') => {
+                transcript.filtering = !transcript.filtering;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                transcript.sel = transcript.sel.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                transcript.sel = (transcript.sel + 1).min(max_sel);
+            }
+            KeyCode::Backspace => {
+                if transcript.filtering {
+                    if event
+                        .as_key_event()
+                        .unwrap()
+                        .modifiers
+                        .contains(KeyModifiers::CONTROL)
+                    {
+                        transcript.filter.clear();
+                    } else {
+                        transcript.filter.pop();
+                    }
+                    transcript.sel = 0;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(track) = transcript.visible_tracks().get(transcript.sel).map(|t| (*t).clone())
+                    && let Some(res) = response
+                {
+                    Self::load_transcript_track(transcript, &res.get_id(), args, &track).await;
+                }
+            }
+            _ => {}
+        }
+        // Typing while filtering narrows the list (handled after match so
+        // that `/`, Esc and navigation above keep working).
+        if transcript.filtering
+            && event.is_key_press()
+            && let KeyCode::Char(ch) = event.as_key_event().unwrap().code
+            && ch != '/'
+        {
+            transcript.filter.push(ch);
+            transcript.sel = 0;
+        }
+    }
+
+    /// Open a local subtitle file in the transcript reading view.
+    fn open_transcript_file(transcript: &mut ui::TranscriptState, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        debug!(path = %path.display(), "sidebar: opening transcript file");
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut lines = clean_srt(&text);
+        if lines.is_empty() {
+            lines = clean_caption_text(&text);
+        }
+        transcript.open = true;
+        transcript.picking = false;
+        transcript.title = name;
+        transcript.lang = transcript_lang_from_name(path);
+        transcript.scroll = 0;
+        transcript.summary.clear();
+        transcript.selected = None;
+        transcript.lines = if lines.is_empty() {
+            vec!["Empty or unreadable transcript file".to_string()]
+        } else {
+            lines
+        };
+    }
+
+    /// Fetch one picked track into the reading view.
+    async fn load_transcript_track(
+        transcript: &mut ui::TranscriptState,
+        video_id: &str,
+        args: &Cli,
+        track: &ui::TranscriptTrack,
+    ) {
+        transcript.lines = vec!["Loading transcript…".to_string()];
+        transcript.summary.clear();
+        transcript.scroll = 0;
+        match Self::fetch_transcript_for(video_id, args, &track.lang).await {
+            Ok((lang, lines)) => {
+                debug!(count = lines.len(), "load_transcript_track: loaded");
+                transcript.lang = lang;
+                transcript.lines = lines;
+                transcript.selected = Some(track.clone());
+                transcript.picking = false;
+            }
+            Err(e) => {
+                debug!(?e, "load_transcript_track: failed");
+                transcript.list_error = format!("Transcript unavailable: {e:#}");
+                transcript.picking = true;
+            }
+        }
+    }
+
+    /// Handle key events when the setup menu is open.
+    /// Applying the playback mode respawns mpv (handled by the main loop).
+    /// `t` cycles the theme live (persisted to theme.toml).
+    async fn handle_setup_event(
+        setup: &mut ui::SetupState,
+        mpv: &mut MpvIpc,
+        midi: &mut MidiRuntime,
+        audio_names: &mut Vec<String>,
+        current_audio_device: &mut Option<String>,
+        theme: &mut Theme,
+        event: &ratatui::crossterm::event::Event,
+    ) -> SetupOutcome {
+        if !event.is_key_press() {
+            return SetupOutcome::Continue;
+        }
+        match event.as_key_event().unwrap().code {
+            KeyCode::Esc => {
+                setup.open = false;
+            }
+            KeyCode::Tab => {
+                setup.advance_focus();
+            }
+            KeyCode::Char('t') => {
+                let next = Theme::next_preset_name(&theme.preset);
+                *theme = Theme::preset(next);
+                theme.save();
+                setup.notice = format!("Theme: {next} (saved)");
+            }
+            KeyCode::Up | KeyCode::Char('k') => setup.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => setup.move_selection(1),
+            KeyCode::Enter => match setup.focus {
+                ui::SetupFocus::MidiIn => {
+                    midi.connect_input(midi_input_port_at(setup.midi_in_sel));
+                    setup.notice = if midi.conn_in.is_some() {
+                        format!(
+                            "MIDI input: {}",
+                            setup.midi_in.get(setup.midi_in_sel).cloned().unwrap_or_default()
+                        )
+                    } else {
+                        "MIDI input disconnected".to_string()
+                    };
+                }
+                ui::SetupFocus::MidiOut => {
+                    midi.connect_output(midi_output_port_at(setup.midi_out_sel));
+                    setup.notice = if midi.conn_out.is_some() {
+                        format!(
+                            "MIDI output: {}",
+                            setup
+                                .midi_out
+                                .get(setup.midi_out_sel)
+                                .cloned()
+                                .unwrap_or_default()
+                        )
+                    } else {
+                        "MIDI output disconnected".to_string()
+                    };
+                }
+                ui::SetupFocus::Audio => {
+                    if let Some(name) = audio_names.get(setup.audio_sel).cloned() {
+                        match mpv.set_prop("audio-device", &name).await {
+                            Ok(()) => {
+                                *current_audio_device = Some(name.clone());
+                                setup.notice = format!("Audio output: {name}");
+                            }
+                            Err(e) => setup.notice = format!("Audio output failed: {e:#}"),
+                        }
+                    }
+                }
+                ui::SetupFocus::Playback => {
+                    let audio_only = setup.play_audio_only();
+                    setup.notice = if audio_only {
+                        "MPV respawned audio-only".to_string()
+                    } else {
+                        "MPV respawned with video".to_string()
+                    };
+                    return SetupOutcome::Respawn { audio_only };
+                }
+            },
+            _ => {}
+        }
+        SetupOutcome::Continue
+    }
+
+    /// Refresh the setup menu lists: MIDI port names + mpv audio devices +
+    /// playback mode (preselected from the current mpv mode).
+    async fn refresh_setup(
+        setup: &mut ui::SetupState,
+        mpv: &mut MpvIpc,
+        audio_names: &mut Vec<String>,
+        audio_only: bool,
+    ) {
+        setup.midi_in = midi_input_names();
+        setup.midi_out = midi_output_names();
+        setup.midi_in_sel = setup
+            .midi_in_sel
+            .min(setup.midi_in.len().saturating_sub(1));
+        setup.midi_out_sel = setup
+            .midi_out_sel
+            .min(setup.midi_out.len().saturating_sub(1));
+        setup.play_modes = vec!["Audio only".to_string(), "Video".to_string()];
+        setup.play_sel = if audio_only { 0 } else { 1 };
+        match mpv.get_prop::<Vec<AudioDevice>>("audio-device-list").await {
+            Ok(devices) => {
+                *audio_names = devices.iter().map(|d| d.name.clone()).collect();
+                setup.audio_devices = devices.iter().map(|d| d.display()).collect();
+                if let Ok(current) = mpv.get_prop::<String>("audio-device").await
+                    && let Some(idx) = audio_names.iter().position(|n| *n == current)
+                {
+                    setup.audio_sel = idx;
+                }
+                setup.notice.clear();
+            }
+            Err(e) => setup.notice = format!("audio-device-list failed: {e:#}"),
+        }
+    }
+
+    /// List available transcript tracks for a video: manual subtitles
+    /// first, then auto-generated captions.
+    async fn list_transcript_tracks(
+        video_id: &str,
+        args: &Cli,
+    ) -> Result<Vec<ui::TranscriptTrack>> {
+        info!(?video_id, "list_transcript_tracks: starting");
+        let fetcher = Self::get_downloader(args).await?;
+        let url = format!("https://www.youtube.com/watch?v={video_id}");
+        let video = fetcher.fetch_video_infos(url).await?;
+        let mut manual: Vec<String> = video.subtitles.keys().cloned().collect();
+        manual.sort();
+        let mut auto: Vec<String> = video.automatic_captions.keys().cloned().collect();
+        auto.sort();
+        debug!(?manual, ?auto, "list_transcript_tracks: found");
+        let tracks = manual
+            .into_iter()
+            .map(|lang| ui::TranscriptTrack { lang, manual: true })
+            .chain(auto.into_iter().map(|lang| ui::TranscriptTrack {
+                lang,
+                manual: false,
+            }))
+            .collect();
+        Ok(tracks)
+    }
+
+    /// Fetch one transcript track by language: manual subtitles first
+    /// (SRT preferred), then automatic captions. Plain reqwest download
+    /// with a timeout — the parallel yt-dlp asset machinery hangs on some
+    /// timedtext URLs. Returns (lang, lines).
+    async fn fetch_transcript_for(
+        video_id: &str,
+        args: &Cli,
+        lang: &str,
+    ) -> Result<(String, Vec<String>)> {
+        use yt_dlp::model::caption::Extension;
+
+        info!(?video_id, ?lang, "fetch_transcript_for: starting");
+        let fetcher = Self::get_downloader(args).await?;
+        let url = format!("https://www.youtube.com/watch?v={video_id}");
+        let video = fetcher.fetch_video_infos(url).await?;
+
+        let manual: Vec<Subtitle> = video.subtitles.get(lang).cloned().unwrap_or_default();
+        let subs: Vec<Subtitle> = if manual.is_empty() {
+            video
+                .automatic_captions
+                .get(lang)
+                .map(|caps| {
+                    caps.iter()
+                        .map(|c| Subtitle::from_automatic_caption(c, lang.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            manual
+        };
+        let sub = subs
+            .iter()
+            .find(|s| s.is_format(&Extension::Srt))
+            .or_else(|| subs.iter().find(|s| s.is_format(&Extension::Vtt)))
+            .or_else(|| subs.first())
+            .context("No downloadable track for this language")?;
+        debug!(url = %sub.url, ext = sub.file_extension(), "fetch_transcript_for: downloading");
+        let text = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?
+            .get(&sub.url)
+            .send()
+            .await
+            .context("Transcript download failed")?
+            .error_for_status()
+            .context("Transcript download failed")?
+            .text()
+            .await?;
+        debug!(bytes = text.len(), "fetch_transcript_for: downloaded");
+        // SRT/VTT clean first, XML-caption clean as fallback (auto tracks).
+        let mut lines = clean_srt(&text);
+        if lines.is_empty() {
+            lines = clean_caption_text(&text);
+        }
+        if lines.is_empty() {
+            bail!("Transcript content came back empty");
+        }
+        debug!(count = lines.len(), "fetch_transcript_for: cleaned");
+        Ok((lang.to_string(), lines))
+    }
+
+    /// Summarize script lines with the first local Ollama model.
+    async fn summarize_lines(lines: &[String]) -> Result<(String, String)> {
+        use tokio_stream::StreamExt;
+
+        let ollama = Ollama::default();
+        let models = ollama.list_local_models().await?;
+        let model = models
+            .first()
+            .context("No local Ollama models available")?
+            .name
+            .clone();
+        let mut stream = ollama
+            .generate_stream(GenerationRequest::new(
+                model.clone(),
+                format!(
+                    "Summarize this content in a few bullet points:\n```{}```",
+                    lines.join("\n")
+                ),
+            ))
+            .await?;
+        let mut out = String::new();
+        while let Some(res) = stream.next().await {
+            for resp in res? {
+                out.push_str(&resp.response);
+            }
+        }
+        Ok((model, out))
+    }
+}
+
+fn listen_midi_input(
+    midi_in: MidiInput,
+    opt_midi_in_port: Option<MidiInputPort>,
+    midi_volume_tx: std::sync::mpsc::Sender<u8>,
+    midi_pause_tx: std::sync::mpsc::Sender<()>,
+) -> Option<MidiInputConnection<(std::sync::mpsc::Sender<u8>, std::sync::mpsc::Sender<()>)>> {
+    if let Some(in_port) = opt_midi_in_port {
+        midi_in
+            .connect(
+                &in_port,
+                "midir-read-input",
+                move |_, message, midi_tx| {
+                    let midi_event = midi::parse_midi(message);
+                    match midi_event {
+                        midi::MidiEvent::NoteOn {
+                            channel: _,
+                            note,
+                            velocity: _,
+                        } => {
+                            if matches!(note, 93 | 94) {
+                                let _ = midi_tx.1.send(());
+                            }
+                        }
+                        midi::MidiEvent::PitchBend { channel: _, value } => {
+                            let _ = midi_tx.0.send(pitch_bend_to_mpv_vol(value));
+                        }
+                        _ => {}
+                    }
+                },
+                (midi_volume_tx, midi_pause_tx),
+            )
+            .ok()
+    } else {
+        None
+    }
+}
+
+fn midi_output_names() -> Vec<String> {
+    let mut names = vec!["None".to_string()];
+    if let Ok(midi_out) = MidiOutput::new("ytrs-midi-out") {
+        for (i, port) in midi_out.ports().iter().enumerate() {
+            names.push(format!("{i}:{}", midi_out.port_name(port).unwrap_or_default()));
+        }
+    }
+    names
+}
+
+fn midi_input_names() -> Vec<String> {
+    let mut names = vec!["None".to_string()];
+    if let Ok(midi_in) = MidiInput::new("ytrs-midi-in") {
+        for (i, port) in midi_in.ports().iter().enumerate() {
+            names.push(format!(
+                "{i}:{}",
+                midi_in.port_name(port).unwrap_or_default()
+            ));
+        }
+    }
+    names
+}
+
+/// Selection index into the `*_names()` lists: 0 is "None", otherwise ports[idx - 1].
+fn midi_output_port_at(sel: usize) -> Option<MidiOutputPort> {
+    if sel == 0 {
+        return None;
+    }
+    MidiOutput::new("ytrs-midi-out")
+        .ok()?
+        .ports()
+        .get(sel - 1)
+        .cloned()
+}
+
+fn midi_input_port_at(sel: usize) -> Option<MidiInputPort> {
+    if sel == 0 {
+        return None;
+    }
+    MidiInput::new("ytrs-midi-in")
+        .ok()?
+        .ports()
+        .get(sel - 1)
+        .cloned()
 }
 
 fn u32_to_midi(val: u32) -> u8 {
@@ -1776,6 +2700,70 @@ fn pitch_bend_to_mpv_vol(bend: i16) -> u8 {
     let normalized = bend as i32 + 8192;
     let vol = ((normalized * 130) + 8191) / 16383;
     vol as u8
+}
+
+/// Subtitle/transcript file extensions opened in the transcript view.
+fn is_transcript_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref(),
+        Some("srt" | "vtt" | "ass" | "ssa" | "ttml" | "srv3" | "dfxp" | "sbv" | "txt")
+    )
+}
+
+/// Language guess from our `subtitle_{lang}.ext` file names.
+fn transcript_lang_from_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("subtitle_"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Drop `<tags>` from a caption line and unescape common entities.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+/// Keep readable SRT lines: drop counters, timestamps and markup.
+fn clean_srt(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty() && !l.chars().all(|c| c.is_ascii_digit()) && !l.contains("-->")
+        })
+        .map(strip_tags)
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Keep readable auto-caption lines: drop markup, empties and consecutive dupes.
+fn clean_caption_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let cleaned = strip_tags(line).trim().to_string();
+        if !cleaned.is_empty() && out.last() != Some(&cleaned) {
+            out.push(cleaned);
+        }
+    }
+    out
 }
 
 impl VideoInfo {
@@ -1899,28 +2887,6 @@ impl std::fmt::Display for TrackInfo {
         )
     }
 }
-impl std::fmt::Debug for AppAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Download { .. } => f.debug_struct("Download").finish(),
-            Self::Transcript => write!(f, "Transcript"),
-            Self::Player { .. } => f.debug_struct("Player").finish(),
-            Self::Quit => write!(f, "Quit"),
-        }
-    }
-}
-impl From<FormatInquire> for Format {
-    fn from(value: FormatInquire) -> Self {
-        match value {
-            FormatInquire::Audio => Self::Audio {
-                format: Default::default(),
-            },
-            FormatInquire::Video => Self::Video {
-                format: Default::default(),
-            },
-        }
-    }
-}
 impl From<&VideoItem> for YoutubeResponse {
     fn from(value: &VideoItem) -> Self {
         Self::Video(value.clone())
@@ -1939,5 +2905,34 @@ impl From<&VideoItem> for VideoInfo {
             _view_count: value.view_count,
             duration: value.duration,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn transcript_file_detection() {
+        assert!(is_transcript_file(&PathBuf::from("subtitle_en.srt")));
+        assert!(is_transcript_file(&PathBuf::from("sub.VTT".to_lowercase())));
+        assert!(is_transcript_file(&PathBuf::from("a.ass")));
+        assert!(!is_transcript_file(&PathBuf::from("song.mp3")));
+        assert!(!is_transcript_file(&PathBuf::from("video.mp4")));
+        assert!(!is_transcript_file(&PathBuf::from("noext")));
+    }
+
+    #[test]
+    fn transcript_lang_from_our_filenames() {
+        assert_eq!(
+            transcript_lang_from_name(&PathBuf::from("subtitle_en.srt")),
+            "en"
+        );
+        assert_eq!(
+            transcript_lang_from_name(&PathBuf::from("subtitle_fr.srv3")),
+            "fr"
+        );
+        assert_eq!(transcript_lang_from_name(&PathBuf::from("other.srt")), "");
     }
 }
