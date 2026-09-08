@@ -20,7 +20,7 @@ use ratatui::crossterm::event::{KeyCode, read};
 use ratatui_image::picker;
 use rustypipe::{
     client::RustyPipe,
-    model::{TrackItem, VideoItem},
+    model::{TrackItem, VideoItem, paginator::Paginator},
 };
 use serde_json::json;
 use std::fs::OpenOptions;
@@ -265,6 +265,18 @@ struct AudioDevice {
 /// Background YouTube search: resolved results or a displayable error.
 type SearchTask =
     tokio::task::JoinHandle<Result<Vec<(String, YoutubeResponse)>, String>>;
+
+/// One page of suggestions + pager for the next page (Video only).
+struct SuggestPage {
+    rows: Vec<(String, YoutubeResponse)>,
+    pager: Option<Paginator<VideoItem>>,
+}
+
+/// Background suggestions fetch (initial page or continuation).
+type SuggestTask = tokio::task::JoinHandle<Result<SuggestPage, String>>;
+
+/// Background thumbnail bytes fetch: (video id, image bytes).
+type ThumbTask = tokio::task::JoinHandle<Vec<(String, image::DynamicImage)>>;
 
 /// Outcome of a setup-menu event: keep going or respawn mpv with a new
 /// audio-only/video mode.
@@ -728,6 +740,12 @@ impl YoutubeRs {
         let mut popup_query = String::new();
         let mut search_task: Option<SearchTask> = None;
         let mut search_error: Option<String> = None;
+        let mut suggestion = ui::SuggestionState::default();
+        let mut sugg_task: Option<SuggestTask> = None;
+        let mut sugg_error: Option<String> = None;
+        let mut sugg_pager: Option<Paginator<VideoItem>> = None;
+        let mut sugg_append = false;
+        let mut thumb_task: Option<ThumbTask> = None;
         let mut transcript = ui::TranscriptState::default();
         let mut setup = ui::SetupState::default();
         let mut playlist = Playlist::default();
@@ -813,6 +831,64 @@ impl YoutubeRs {
                 }
             }
 
+            // Background suggestions finished: collect without blocking.
+            if sugg_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = sugg_task.take().expect("suggest task checked above");
+                match task.await {
+                    Ok(Ok(page)) => {
+                        debug!(count = page.rows.len(), "run_tui: suggestions done");
+                        if sugg_append {
+                            suggestion.items.extend(page.rows);
+                        } else {
+                            suggestion.items = page.rows;
+                            suggestion.selected = 0;
+                            suggestion.scrolltop = 0;
+                            suggestion.thumbs.clear();
+                        }
+                        sugg_append = false;
+                        sugg_pager = page.pager;
+                        sugg_error = None;
+                        suggestion.loading = false;
+                        Self::spawn_missing_thumbs(&suggestion, &mut thumb_task);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(?e, "run_tui: suggestions failed");
+                        sugg_error = Some(e);
+                        suggestion.loading = false;
+                    }
+                    Err(e) => {
+                        debug!(?e, "run_tui: suggestions cancelled");
+                        sugg_error = None;
+                        suggestion.loading = false;
+                    }
+                }
+            }
+
+            // Background thumbnails finished: build protocols on this thread.
+            if thumb_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = thumb_task.take().expect("thumb task checked above");
+                if let Ok(done) = task.await {
+                    if let Some(picker) = picker.as_ref() {
+                        for (id, img) in done {
+                            suggestion
+                                .thumbs
+                                .insert(id, picker.new_resize_protocol(img));
+                        }
+                    }
+                    if suggestion.thumbs.len() > 150 {
+                        let live: std::collections::HashSet<&String> = suggestion
+                            .items
+                            .iter()
+                            .map(|(_, res)| match res {
+                                YoutubeResponse::Video(v) => &v.id,
+                                YoutubeResponse::Track(t) => &t.id,
+                            })
+                            .collect();
+                        suggestion.thumbs.retain(|id, _| live.contains(id));
+                    }
+                }
+            }
+
             let _ = term.draw(|f| {
                 let mut ctx = ui::DrawCtx {
                     playback: ui::Playback {
@@ -832,6 +908,7 @@ impl YoutubeRs {
                     },
                     transcript: &transcript,
                     setup: &setup,
+                    suggestion: &mut suggestion,
                     playlist: &playlist,
                     media: ui::Media::from_parts(response, &file, empty_player),
                     artwork: if launch.no_art { &mut no_art_img } else { &mut img },
@@ -888,6 +965,25 @@ impl YoutubeRs {
                         &mut transcript,
                         response,
                         &self.args,
+                        &event,
+                    )
+                    .await;
+                } else if suggestion.open {
+                    Self::handle_suggestion_event(
+                        &mut suggestion,
+                        response,
+                        &mut file,
+                        &mut mpv,
+                        &mut img,
+                        audio_only,
+                        picker.as_ref(),
+                        &mut playlist,
+                        &self.args,
+                        &mut sugg_task,
+                        &mut sugg_error,
+                        &mut sugg_pager,
+                        &mut sugg_append,
+                        &mut thumb_task,
                         &event,
                     )
                     .await;
@@ -955,10 +1051,19 @@ impl YoutubeRs {
                         &mut img,
                         audio_only,
                         picker.as_ref(),
+                        &mut suggestion,
+                        &mut sugg_task,
+                        &mut sugg_error,
                     )
                     .await
                 {
                     if let Some(task) = search_task.take() {
+                        task.abort();
+                    }
+                    if let Some(task) = sugg_task.take() {
+                        task.abort();
+                    }
+                    if let Some(task) = thumb_task.take() {
                         task.abort();
                     }
                     break;
@@ -1117,6 +1222,138 @@ impl YoutubeRs {
             PlaylistItem::File(path) => {
                 Self::play_file(response, file, mpv, img, path, picker).await;
             }
+        }
+    }
+
+    /// Run a suggestions fetch off the TUI event loop: related items for
+    /// the given id, in display-row form. Video paginates, Music is finite.
+    async fn run_suggestions(api: YoutubeAPI, id: String) -> Result<SuggestPage, String> {
+        match api {
+            YoutubeAPI::Video => {
+                let details = RustyPipe::new()
+                    .query()
+                    .unauthenticated()
+                    .video_details(&id)
+                    .await
+                    .map_err(|e| format!("Suggestions failed: {e:#}"))?;
+                YoutubeRs::cleanup_rustypipe_cache();
+                let rows = details
+                    .recommended
+                    .items
+                    .iter()
+                    .map(|v| (VideoInfo::from(v).to_string(), v.into()))
+                    .collect();
+                Ok(SuggestPage {
+                    rows,
+                    pager: Some(details.recommended),
+                })
+            }
+            YoutubeAPI::Music => {
+                let details = RustyPipe::new()
+                    .query()
+                    .unauthenticated()
+                    .music_details(&id)
+                    .await
+                    .map_err(|e| format!("Suggestions failed: {e:#}"))?;
+                YoutubeRs::cleanup_rustypipe_cache();
+                let Some(related_id) = details.related_id else {
+                    return Err("No related items for this track".to_string());
+                };
+                let related = RustyPipe::new()
+                    .query()
+                    .unauthenticated()
+                    .music_related(&related_id)
+                    .await
+                    .map_err(|e| format!("Suggestions failed: {e:#}"))?;
+                YoutubeRs::cleanup_rustypipe_cache();
+                let rows = related
+                    .tracks
+                    .into_iter()
+                    .chain(related.other_versions)
+                    .map(|track| (TrackInfo::from(&track).to_string(), track.into()))
+                    .collect();
+                Ok(SuggestPage { rows, pager: None })
+            }
+        }
+    }
+
+    /// Fetch the next suggestions page (Video continuation).
+    async fn run_suggest_more(
+        pager: Paginator<VideoItem>,
+    ) -> Result<SuggestPage, String> {
+        let query = RustyPipe::new().query();
+        match pager
+            .next(query)
+            .await
+            .map_err(|e| format!("More suggestions failed: {e:#}"))?
+        {
+            Some(next) => {
+                let rows = next
+                    .items
+                    .iter()
+                    .map(|v| (VideoInfo::from(v).to_string(), v.into()))
+                    .collect();
+                Ok(SuggestPage {
+                    rows,
+                    pager: Some(next),
+                })
+            }
+            None => Ok(SuggestPage {
+                rows: Vec::new(),
+                pager: None,
+            }),
+        }
+    }
+
+    /// Smallest thumbnail (id, url) of a response, to keep downloads light.
+    fn thumb_url(res: &YoutubeResponse) -> Option<(String, String)> {
+        let (id, thumbs) = match res {
+            YoutubeResponse::Video(v) => (v.id.clone(), &v.thumbnail),
+            YoutubeResponse::Track(t) => (t.id.clone(), &t.cover),
+        };
+        thumbs
+            .iter()
+            .filter(|t| t.width > 0)
+            .min_by_key(|t| t.width)
+            .or(thumbs.first())
+            .map(|t| (id, t.url.clone()))
+    }
+
+    /// Download + decode thumbnails off the event loop. Failures are skipped.
+    async fn fetch_thumbs(requests: Vec<(String, String)>) -> Vec<(String, image::DynamicImage)> {
+        let client = reqwest::Client::new();
+        let mut out = Vec::new();
+        for (id, url) in requests {
+            if let Ok(resp) = client.get(&url).send().await
+                && let Ok(bytes) = resp.bytes().await
+                && let Ok(img) = image::load_from_memory(&bytes)
+            {
+                out.push((id, img));
+            }
+        }
+        out
+    }
+
+    /// Spawn a thumbnail fetch for suggestion items missing from the cache.
+    /// No-op while another thumbnail task runs.
+    fn spawn_missing_thumbs(
+        suggestion: &ui::SuggestionState,
+        thumb_task: &mut Option<ThumbTask>,
+    ) {
+        if thumb_task.is_some() {
+            return;
+        }
+        let missing: Vec<(String, String)> = suggestion
+            .items
+            .iter()
+            .filter_map(|(_, res)| {
+                let (id, url) = Self::thumb_url(res)?;
+                (!suggestion.thumbs.contains_key(&id)).then_some((id, url))
+            })
+            .collect();
+        if !missing.is_empty() {
+            debug!(count = missing.len(), "run_tui: fetching thumbnails");
+            *thumb_task = Some(tokio::spawn(Self::fetch_thumbs(missing)));
         }
     }
 
@@ -1923,6 +2160,9 @@ impl YoutubeRs {
         img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
         audio_only: bool,
         picker: Option<&picker::Picker>,
+        suggestion: &mut ui::SuggestionState,
+        sugg_task: &mut Option<SuggestTask>,
+        sugg_error: &mut Option<String>,
     ) -> ControlFlow<()> {
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('q') {
             return ControlFlow::Break(());
@@ -1970,6 +2210,44 @@ impl YoutubeRs {
                     Err(e) => error!(?e, "player: background download failed"),
                 }
             });
+        }
+        // Suggestion screen for the current stream (same-type related
+        // items). Fetched in the background, like search.
+        if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char('s')
+        {
+            if suggestion.open {
+                if let Some(task) = sugg_task.take() {
+                    task.abort();
+                }
+                suggestion.open = false;
+                suggestion.loading = false;
+            } else {
+                *open_popup = false;
+                suggestion.open = true;
+                suggestion.selected = 0;
+                suggestion.scrolltop = 0;
+                suggestion.items.clear();
+                suggestion.thumbs.clear();
+                sugg_error.take();
+                if let Some(res) = response {
+                    let api = match res {
+                        YoutubeResponse::Video(_) => YoutubeAPI::Video,
+                        YoutubeResponse::Track(_) => YoutubeAPI::Music,
+                    };
+                    suggestion.api = Some(api);
+                    suggestion.title = res.get_name();
+                    suggestion.notice.clear();
+                    suggestion.loading = true;
+                    let id = res.get_id();
+                    debug!(?api, ?id, "player: spawning suggestions fetch");
+                    *sugg_task = Some(tokio::spawn(Self::run_suggestions(api, id)));
+                } else {
+                    suggestion.api = None;
+                    suggestion.title.clear();
+                    suggestion.notice = "Play a stream first".to_string();
+                    suggestion.loading = false;
+                }
+            }
         }
         if event.is_key_press() && event.as_key_event().unwrap().code == KeyCode::Char(' ') {
             *pause_state = !*pause_state;
@@ -2096,6 +2374,170 @@ impl YoutubeRs {
                 if let Some(item) = playlist.current().cloned() {
                     Self::play_item(response, file, mpv, img, args, item, audio_only, picker)
                         .await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// (Re)fetch suggestions for `id`, replacing the list.
+    #[allow(clippy::too_many_arguments)]
+    fn start_suggest_fetch(
+        suggestion: &mut ui::SuggestionState,
+        sugg_task: &mut Option<SuggestTask>,
+        sugg_error: &mut Option<String>,
+        sugg_pager: &mut Option<Paginator<VideoItem>>,
+        sugg_append: &mut bool,
+        thumb_task: &mut Option<ThumbTask>,
+        api: YoutubeAPI,
+        id: String,
+    ) {
+        if let Some(task) = sugg_task.take() {
+            task.abort();
+        }
+        if let Some(task) = thumb_task.take() {
+            task.abort();
+        }
+        sugg_error.take();
+        suggestion.api = Some(api);
+        suggestion.items.clear();
+        suggestion.thumbs.clear();
+        suggestion.selected = 0;
+        suggestion.scrolltop = 0;
+        suggestion.loading = true;
+        *sugg_pager = None;
+        *sugg_append = false;
+        debug!(?api, ?id, "suggestion: spawning fetch");
+        *sugg_task = Some(tokio::spawn(Self::run_suggestions(api, id)));
+    }
+
+    /// Fetch the next page when the selection nears the bottom (Video only:
+    /// Music has no continuation).
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_fetch_more_suggestions(
+        suggestion: &mut ui::SuggestionState,
+        sugg_task: &mut Option<SuggestTask>,
+        sugg_pager: &mut Option<Paginator<VideoItem>>,
+        sugg_append: &mut bool,
+    ) {
+        if sugg_task.is_some() || suggestion.items.is_empty() {
+            return;
+        }
+        if suggestion.selected + 2 < suggestion.items.len() {
+            return;
+        }
+        if let Some(pager) = sugg_pager.clone() {
+            debug!("suggestion: fetching next page");
+            *sugg_append = true;
+            suggestion.loading = true;
+            *sugg_task = Some(tokio::spawn(Self::run_suggest_more(pager)));
+        }
+    }
+
+    /// Handle key events when the suggestion screen is open: 2D grid nav,
+    /// Enter plays, p queues, Tab switches Music/Video + refetch.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_suggestion_event(
+        suggestion: &mut ui::SuggestionState,
+        response: &mut Option<YoutubeResponse>,
+        file: &mut Option<(TaggedFile, String)>,
+        mpv: &mut MpvIpc,
+        img: &mut Option<ratatui_image::protocol::StatefulProtocol>,
+        audio_only: bool,
+        picker: Option<&picker::Picker>,
+        playlist: &mut Playlist,
+        args: &Cli,
+        sugg_task: &mut Option<SuggestTask>,
+        sugg_error: &mut Option<String>,
+        sugg_pager: &mut Option<Paginator<VideoItem>>,
+        sugg_append: &mut bool,
+        thumb_task: &mut Option<ThumbTask>,
+        event: &ratatui::crossterm::event::Event,
+    ) {
+        if !event.is_key_press() {
+            return;
+        }
+        match event.as_key_event().unwrap().code {
+            KeyCode::Esc | KeyCode::Char('s') => {
+                if let Some(task) = sugg_task.take() {
+                    task.abort();
+                }
+                if let Some(task) = thumb_task.take() {
+                    task.abort();
+                }
+                suggestion.open = false;
+                suggestion.loading = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                suggestion.selected =
+                    ui::grid_move(suggestion.selected, suggestion.items.len(), 0, -1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                suggestion.selected =
+                    ui::grid_move(suggestion.selected, suggestion.items.len(), 0, 1);
+                Self::maybe_fetch_more_suggestions(
+                    suggestion,
+                    sugg_task,
+                    sugg_pager,
+                    sugg_append,
+                );
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                suggestion.selected =
+                    ui::grid_move(suggestion.selected, suggestion.items.len(), -1, 0);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                suggestion.selected =
+                    ui::grid_move(suggestion.selected, suggestion.items.len(), 1, 0);
+            }
+            KeyCode::Enter => {
+                if let Some((_, vid)) =
+                    suggestion.items.get(suggestion.selected).cloned()
+                {
+                    Self::play_item(
+                        response,
+                        file,
+                        mpv,
+                        img,
+                        args,
+                        PlaylistItem::Stream(vid),
+                        audio_only,
+                        picker,
+                    )
+                    .await;
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some((_, vid)) =
+                    suggestion.items.get(suggestion.selected).cloned()
+                {
+                    let first = playlist.is_empty();
+                    playlist.add(PlaylistItem::Stream(vid.clone()));
+                    debug!(first, "suggestion: added entry to playlist");
+                    if first {
+                        Self::play_stream(response, mpv, img, args, vid, audio_only, picker)
+                            .await;
+                    }
+                }
+            }
+            KeyCode::Tab => {
+                if let Some(res) = response {
+                    let api = match suggestion.api {
+                        Some(YoutubeAPI::Music) => YoutubeAPI::Video,
+                        _ => YoutubeAPI::Music,
+                    };
+                    Self::start_suggest_fetch(
+                        suggestion,
+                        sugg_task,
+                        sugg_error,
+                        sugg_pager,
+                        sugg_append,
+                        thumb_task,
+                        api,
+                        res.get_id(),
+                    );
+                } else {
+                    suggestion.notice = "Play a stream first".to_string();
                 }
             }
             _ => {}

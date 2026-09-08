@@ -32,10 +32,11 @@ pub enum ActiveView {
     Search,
     Transcript,
     Setup,
+    Suggestion,
 }
 
 impl Screen {
-    /// Overlay priority: setup > transcript > search > player.
+    /// Overlay priority: setup > transcript > suggestion > playlist > sidebar > search > player.
     pub fn from_ctx(ctx: &DrawCtx<'_>) -> Self {
         if !ctx.playback.started {
             Self::Loading
@@ -43,6 +44,8 @@ impl Screen {
             Self::Active(ActiveView::Setup)
         } else if ctx.transcript.open {
             Self::Active(ActiveView::Transcript)
+        } else if ctx.suggestion.open {
+            Self::Active(ActiveView::Suggestion)
         } else if ctx.search_open {
             Self::Active(ActiveView::Search)
         } else {
@@ -126,6 +129,7 @@ pub struct DrawCtx<'a> {
     pub search: SearchView<'a>,
     pub transcript: &'a TranscriptState,
     pub setup: &'a SetupState,
+    pub suggestion: &'a mut SuggestionState,
     pub playlist: &'a Playlist,
     pub media: Media<'a>,
     pub artwork: &'a mut Option<ratatui_image::protocol::StatefulProtocol>,
@@ -146,6 +150,7 @@ pub fn draw_screen(ctx: &mut DrawCtx<'_>, f: &mut Frame<'_>) {
                 ActiveView::Search => ctx.search.render(f, panel_area, ctx.theme),
                 ActiveView::Transcript => ctx.transcript.render(f, panel_area, ctx.theme),
                 ActiveView::Setup => ctx.setup.render(f, panel_area, ctx.theme),
+                ActiveView::Suggestion => ctx.suggestion.render(f, panel_area, ctx.theme),
                 ActiveView::Player => PlayerView {
                     media: ctx.media,
                     playback_time: ctx.playback.time,
@@ -315,6 +320,173 @@ impl SearchView<'_> {
         )
         .direction(ratatui::widgets::ListDirection::TopToBottom);
         f.render_stateful_widget(list, areas[1], self.selected);
+    }
+}
+
+/// Columns in the suggestion grid.
+pub const SUGGEST_COLS: usize = 2;
+/// Card geometry in cells (thumbnail box + 2 title lines + borders).
+const SUGGEST_THUMB_H: u16 = 8;
+const SUGGEST_TITLE_H: u16 = 2;
+const SUGGEST_CARD_H: u16 = SUGGEST_THUMB_H + SUGGEST_TITLE_H + 2;
+
+/// 2D grid movement over a row-major list. Returns the clamped index.
+pub fn grid_move(selected: usize, len: usize, dx: i32, dy: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let cols = SUGGEST_COLS;
+    let sel = selected.min(len - 1);
+    let (mut row, mut col) = (sel / cols, sel % cols);
+    if dx != 0 {
+        let row_len = if row == (len - 1) / cols {
+            (len - 1) % cols + 1
+        } else {
+            cols
+        };
+        col = (col as i32 + dx).clamp(0, row_len as i32 - 1) as usize;
+    }
+    if dy != 0 {
+        let max_row = (len - 1) / cols;
+        row = (row as i32 + dy).clamp(0, max_row as i32) as usize;
+        let row_len = if row == max_row {
+            (len - 1) % cols + 1
+        } else {
+            cols
+        };
+        col = col.min(row_len - 1);
+    }
+    row * cols + col
+}
+
+/// Suggestion screen state: related videos/tracks for the current item.
+#[derive(Default)]
+pub struct SuggestionState {
+    pub open: bool,
+    pub api: Option<YoutubeAPI>,
+    pub title: String,
+    pub items: Vec<(String, YoutubeResponse)>,
+    pub selected: usize,
+    /// First visible grid row.
+    pub scrolltop: usize,
+    /// Thumbnail protocols by video id, filled in the background.
+    pub thumbs: std::collections::HashMap<
+        String,
+        ratatui_image::protocol::StatefulProtocol,
+    >,
+    pub loader: Loader,
+    /// A fetch (initial or next page) is in flight.
+    pub loading: bool,
+    pub notice: String,
+}
+
+impl SuggestionState {
+    fn card_block(selected: bool, theme: &Theme) -> Block<'static> {
+        let block = Block::bordered();
+        if selected {
+            block.style(
+                Style::default()
+                    .fg(theme.sidebar_highlight_fg())
+                    .bg(theme.sidebar_highlight_bg()),
+            )
+        } else {
+            block.style(Style::default().fg(theme.player_fg()).bg(theme.player_bg()))
+        }
+    }
+
+    pub fn render(&mut self, f: &mut Frame<'_>, area: Rect, theme: &Theme) {
+        if self.loading {
+            self.loader.tick();
+        }
+        let mut footer = String::from(
+            "[(hjkl/arrows) Move | (Enter) Play | (p) +Playlist | (Tab) Music/Video | (s/Esc) Close]",
+        );
+        if self.loading && !self.items.is_empty() {
+            footer = format!("{footer} Loading {}…", self.loader.current());
+        }
+        let outer = Block::bordered()
+            .title_top(format!(
+                "Suggestions ({}): {}",
+                self.api.unwrap_or_default(),
+                self.title
+            ))
+            .title_alignment(HorizontalAlignment::Center)
+            .title_bottom(footer)
+            .title_alignment(HorizontalAlignment::Center)
+            .style(Style::default().fg(theme.player_fg()).bg(theme.player_bg()));
+        let inner = outer.inner(area);
+        outer.render(area, f.buffer_mut());
+
+        if self.items.is_empty() {
+            let status = if self.loading {
+                format!("Loading… (Esc to cancel)")
+            } else if !self.notice.is_empty() {
+                self.notice.clone()
+            } else {
+                "No suggestions".to_string()
+            };
+            Paragraph::new(status).render(inner, f.buffer_mut());
+            return;
+        }
+
+        let card_h = SUGGEST_CARD_H;
+        let rows_visible = (inner.height / card_h.max(1)).max(1) as usize;
+        let sel_row = self.selected / SUGGEST_COLS;
+        if sel_row < self.scrolltop {
+            self.scrolltop = sel_row;
+        } else if sel_row >= self.scrolltop + rows_visible {
+            self.scrolltop = sel_row - rows_visible + 1;
+        }
+        let col_w = inner.width / SUGGEST_COLS as u16;
+        for r in 0..rows_visible {
+            let row = self.scrolltop + r;
+            for c in 0..SUGGEST_COLS {
+                let idx = row * SUGGEST_COLS + c;
+                if idx >= self.items.len() {
+                    break;
+                }
+                let x = inner.x + c as u16 * col_w;
+                let w = if c + 1 == SUGGEST_COLS {
+                    inner.width.saturating_sub(c as u16 * col_w)
+                } else {
+                    col_w
+                };
+                let card = Rect::new(x, inner.y + r as u16 * card_h, w, card_h);
+                let selected = idx == self.selected;
+                Self::card_block(selected, theme).render(card, f.buffer_mut());
+                let msgs = card.inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                });
+                if msgs.height == 0 || msgs.width == 0 {
+                    continue;
+                }
+                let thumb_h = SUGGEST_THUMB_H.min(msgs.height);
+                let thumb_area = Rect::new(msgs.x, msgs.y, msgs.width, thumb_h);
+                let id = self.items[idx].1.get_id();
+                if let Some(protocol) = self.thumbs.get_mut(&id) {
+                    f.render_stateful_widget(
+                        StatefulImage::default()
+                            .resize(ratatui_image::Resize::Scale(None)),
+                        thumb_area,
+                        protocol,
+                    );
+                } else {
+                    Paragraph::new("…").render(thumb_area, f.buffer_mut());
+                }
+                let title_y = msgs.y + thumb_h;
+                if title_y < msgs.y + msgs.height {
+                    let title_area = Rect::new(
+                        msgs.x,
+                        title_y,
+                        msgs.width,
+                        msgs.y + msgs.height - title_y,
+                    );
+                    Paragraph::new(self.items[idx].0.clone())
+                        .render(title_area, f.buffer_mut());
+                }
+            }
+        }
     }
 }
 
@@ -703,7 +875,7 @@ impl PlayerView<'_> {
                     .title_alignment(HorizontalAlignment::Center)
                     .title_top(format!("[Vol:{}]", self.volume))
                     .title_alignment(HorizontalAlignment::Right)
-                    .title_bottom("['q' Quit | ▲▼ Vol | ◀▶ Seek | Home/End | 'y' Yank | 'd' DL | 'o' Search | 't' Script | 'e' Setup | 'P' List]")
+                    .title_bottom("['q' Quit | ▲▼ Vol | ◀▶ Seek | Home/End | 'y' Yank | 'd' DL | 'o' Search | 't' Script | 'e' Setup | 'P' List | 's' Suggest]")
                     .title_alignment(HorizontalAlignment::Center)
                     .render(area, f.buffer_mut());
                 render_gauge(f, gauge_layout, ratio, self.theme);
@@ -727,7 +899,7 @@ impl PlayerView<'_> {
                         format_time(file_duration as u32),
                     ))
                     .title_alignment(HorizontalAlignment::Center)
-                    .title_bottom("['q' Quit | ▲▼ Vol | ◀▶ Seek | Home/End | 'o' Search | 't' Script | 'e' Setup | 'P' List]")
+                    .title_bottom("['q' Quit | ▲▼ Vol | ◀▶ Seek | Home/End | 'o' Search | 't' Script | 'e' Setup | 'P' List | 's' Suggest]")
                     .title_alignment(HorizontalAlignment::Center)
                     .render(area, f.buffer_mut());
                 render_gauge(f, gauge_layout, ratio, self.theme);
@@ -735,7 +907,7 @@ impl PlayerView<'_> {
             Media::Empty => {
                 player_block(self.theme)
                     .title_alignment(HorizontalAlignment::Center)
-                    .title_bottom("['q' Quit | 'o' Search | 't' Script | 'e' Setup | 'P' List]")
+                    .title_bottom("['q' Quit | 'o' Search | 't' Script | 'e' Setup | 'P' List | 's' Suggest]")
                     .title_alignment(HorizontalAlignment::Center)
                     .render(area, f.buffer_mut());
                 render_gauge(f, gauge_layout, 0.0, self.theme);
@@ -797,6 +969,7 @@ mod tests {
             let transcript = TranscriptState::default();
             let setup = SetupState::default();
             let playlist = Playlist::default();
+            let mut suggestion = SuggestionState::default();
             let mut ctx = DrawCtx {
                 playback: Playback {
                     time: 10.0,
@@ -808,6 +981,7 @@ mod tests {
                 search,
                 transcript: &transcript,
                 setup: &setup,
+                suggestion: &mut suggestion,
                 playlist: &playlist,
                 media: Media::Empty,
                 artwork: &mut None,
@@ -882,6 +1056,7 @@ mod tests {
             let transcript = TranscriptState::default();
             let setup = SetupState::default();
             let playlist = Playlist::default();
+            let mut suggestion = SuggestionState::default();
             let mut ctx = DrawCtx {
                 playback: Playback {
                     time: 10.0,
@@ -893,6 +1068,7 @@ mod tests {
                 search,
                 transcript: &transcript,
                 setup: &setup,
+                suggestion: &mut suggestion,
                 playlist: &playlist,
                 media: Media::Empty,
                 artwork: &mut art,
@@ -1098,6 +1274,7 @@ mod tests {
             let transcript = TranscriptState::default();
             let setup = SetupState::default();
             let playlist = Playlist::default();
+            let mut suggestion = SuggestionState::default();
             let mut ctx = DrawCtx {
                 playback: Playback {
                     time: 10.0,
@@ -1109,6 +1286,7 @@ mod tests {
                 search,
                 transcript: &transcript,
                 setup: &setup,
+                suggestion: &mut suggestion,
                 playlist: &playlist,
                 media: Media::Stream(&response),
                 artwork: &mut None,
@@ -1128,5 +1306,113 @@ mod tests {
             bottom.contains('╭') || bottom.contains('┌') || bottom.contains('+'),
             "stream panel has no visible block:\n{bottom}"
         );
+    }
+
+    #[test]
+    fn grid_move_navigates_two_columns() {
+        // 5 items: rows [0,1] [2,3] [4]
+        assert_eq!(grid_move(0, 5, 1, 0), 1); // l
+        assert_eq!(grid_move(1, 5, 1, 0), 1); // clamp row end
+        assert_eq!(grid_move(1, 5, 0, 1), 3); // j
+        assert_eq!(grid_move(3, 5, 0, 1), 4); // j into short row, col clamped
+        assert_eq!(grid_move(4, 5, 0, 1), 4); // clamp bottom
+        assert_eq!(grid_move(4, 5, 0, -1), 2); // k keeps col
+        assert_eq!(grid_move(0, 5, -1, 0), 0); // clamp left
+        assert_eq!(grid_move(0, 5, 0, -1), 0); // clamp top
+        assert_eq!(grid_move(0, 0, 1, 1), 0); // empty
+        assert_eq!(grid_move(9, 5, 0, 0), 4); // out of range clamps
+    }
+
+    #[test]
+    fn suggestion_grid_renders_titles_and_thumbs() {
+        use ratatui_image::picker::Picker;
+
+        let track: rustypipe::model::TrackItem = serde_json::from_value(serde_json::json!({
+            "id": "track1",
+            "name": "First Song",
+            "duration": 200,
+            "cover": [],
+            "artists": [],
+            "track_type": "track",
+            "by_va": false,
+        }))
+        .expect("test track must deserialize");
+        let video: rustypipe::model::VideoItem = serde_json::from_value(serde_json::json!({
+            "id": "vid2",
+            "name": "Second Video",
+            "duration": null,
+            "thumbnail": [],
+            "channel": null,
+            "publish_date": null,
+            "publish_date_txt": null,
+            "view_count": null,
+            "is_live": false,
+            "is_short": false,
+            "is_upcoming": false,
+            "short_description": null,
+        }))
+        .expect("test video must deserialize");
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let theme = Theme::default();
+            let picker = Picker::halfblocks();
+            let mut state = SuggestionState {
+                open: true,
+                api: Some(YoutubeAPI::Music),
+                title: "Seed".to_string(),
+                items: vec![
+                    ("First Song".to_string(), YoutubeResponse::Track(track)),
+                    ("Second Video".to_string(), YoutubeResponse::Video(video)),
+                    ("Third Song".to_string(), YoutubeResponse::Track(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "track3",
+                            "name": "Third Song",
+                            "duration": 180,
+                            "cover": [],
+                            "artists": [],
+                            "track_type": "track",
+                            "by_va": false,
+                        }))
+                        .unwrap(),
+                    )),
+                ],
+                selected: 1,
+                ..Default::default()
+            };
+            // One cached thumb: first card shows image, others placeholder.
+            let tiny = image::DynamicImage::new_rgb8(8, 8);
+            state
+                .thumbs
+                .insert("track1".to_string(), picker.new_resize_protocol(tiny));
+            state.render(f, f.area(), &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let all = panel_rows(&buf, 0);
+        assert!(all.contains("Suggestions (Music): Seed"), "header missing:\n{all}");
+        assert!(all.contains("First Song"), "title 1 missing:\n{all}");
+        assert!(all.contains("Second Video"), "title 2 missing:\n{all}");
+        // Two uncached cards show the placeholder.
+        assert!(all.contains('…'), "placeholder missing:\n{all}");
+    }
+
+    #[test]
+    fn suggestion_loading_spinner_shows() {
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let theme = Theme::default();
+            let mut state = SuggestionState {
+                open: true,
+                loading: true,
+                ..Default::default()
+            };
+            state.render(f, f.area(), &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let all = panel_rows(&buf, 0);
+        assert!(all.contains("Loading"), "loading status missing:\n{all}");
     }
 }
