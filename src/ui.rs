@@ -419,7 +419,7 @@ impl SuggestionState {
 
         if self.items.is_empty() {
             let status = if self.loading {
-                format!("Loading… (Esc to cancel)")
+                "Loading… (Esc to cancel)".to_string()
             } else if !self.notice.is_empty() {
                 self.notice.clone()
             } else {

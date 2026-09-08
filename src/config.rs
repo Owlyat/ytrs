@@ -377,8 +377,7 @@ fn config_dir() -> PathBuf {
 fn parse_color(s: &str) -> Color {
     let s = s.trim();
     // Hex
-    if s.starts_with('#') {
-        let hex = &s[1..];
+    if let Some(hex) = s.strip_prefix('#') {
         match hex.len() {
             6 => {
                 if let Ok(r) = u8::from_str_radix(&hex[0..2], 16)

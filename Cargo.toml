@@ -3,6 +3,7 @@ name = "ytrs"
 version = "0.1.4"
 authors = ["Owlyat"]
 edition = "2024"
+rust-version = "1.88"
 include = [
   "src/**/*",
   "Cargo.toml",

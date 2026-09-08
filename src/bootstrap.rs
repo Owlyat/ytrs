@@ -240,6 +240,7 @@ fn build_download(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_player(
     file: &Option<std::path::PathBuf>,
     url: &Option<String>,

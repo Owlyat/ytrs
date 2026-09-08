@@ -602,10 +602,10 @@ impl YoutubeRs {
         }
         let mut mpv = MpvIpc::spawn(&opts, spawn_audio_only).await?;
         debug!("run_tui: MPV spawned, applying audio output");
-        if let Some(dev) = &audio_device {
-            if let Err(e) = mpv.set_prop("audio-device", dev).await {
-                warn!(?e, ?dev, "spawn_mpv: could not apply audio-device");
-            }
+        if let Some(dev) = &audio_device
+            && let Err(e) = mpv.set_prop("audio-device", dev).await
+        {
+            warn!(?e, ?dev, "spawn_mpv: could not apply audio-device");
         }
         let mpv_vol = mpv.observe_prop::<f64>("volume", 1.0).await;
         let time_rx = mpv.observe_prop::<f64>("playback-time", 0.0).await;
@@ -789,8 +789,9 @@ impl YoutubeRs {
             // wraparound, forever. Only when playing a queued entry.
             let _ = idle_rx.has_changed();
             let idle_now = *idle_rx.borrow();
-            if !was_idle && idle_now {
-                if Self::play_next_queued(
+            if !was_idle
+                && idle_now
+                && Self::play_next_queued(
                     response,
                     &mut file,
                     &mut mpv,
@@ -801,9 +802,8 @@ impl YoutubeRs {
                     picker.as_ref(),
                 )
                 .await
-                {
-                    debug!("playlist: track ended, advancing");
-                }
+            {
+                debug!("playlist: track ended, advancing");
             }
             was_idle = idle_now;
 
@@ -2051,10 +2051,10 @@ impl YoutubeRs {
     async fn fetch_video_info(args: &Cli, video_id: &str) -> Option<Video> {
         let (libs, out) = Self::get_libs_path(args);
         let libraries = Libraries::new(libs.join("yt-dlp"), libs.join("ffmpeg"));
-        if let Ok(x) = yt_dlp::Downloader::builder(libraries, out).build().await {
-            if let Ok(x) = x.fetch_video_infos(Self::get_video_url(video_id)).await {
-                return Some(x);
-            }
+        if let Ok(x) = yt_dlp::Downloader::builder(libraries, out).build().await
+            && let Ok(x) = x.fetch_video_infos(Self::get_video_url(video_id)).await
+        {
+            return Some(x);
         }
         None
     }
@@ -2144,7 +2144,7 @@ impl YoutubeRs {
             && event.as_key_event().unwrap().code == KeyCode::Char('y')
             && let Some(res) = response
         {
-            let current_url = Self::get_video_url(&res.get_id());
+            let current_url = Self::get_video_url(res.get_id());
             let _ = Self::clipboard(&current_url);
         }
         // Download the current stream in the background (player format).
@@ -2656,18 +2656,18 @@ impl YoutubeRs {
                 }
             }
             // Summarize the loaded script with the first local Ollama model.
-            KeyCode::Char('s') => {
-                if transcript.summary.is_empty() && !transcript.lines.is_empty() {
-                    match Self::summarize_lines(&transcript.lines).await {
-                        Ok((model, text)) => {
-                            let mut out = vec![format!("Model: {model}")];
-                            out.extend(text.lines().map(str::to_string));
-                            transcript.summary = out;
-                        }
-                        Err(e) => {
-                            transcript.summary =
-                                vec![format!("Summarize failed (Ollama?): {e:#}")];
-                        }
+            KeyCode::Char('s')
+                if transcript.summary.is_empty() && !transcript.lines.is_empty() =>
+            {
+                match Self::summarize_lines(&transcript.lines).await {
+                    Ok((model, text)) => {
+                        let mut out = vec![format!("Model: {model}")];
+                        out.extend(text.lines().map(str::to_string));
+                        transcript.summary = out;
+                    }
+                    Err(e) => {
+                        transcript.summary =
+                            vec![format!("Summarize failed (Ollama?): {e:#}")];
                     }
                 }
             }
@@ -2797,7 +2797,7 @@ impl YoutubeRs {
         setup: &mut ui::SetupState,
         mpv: &mut MpvIpc,
         midi: &mut MidiRuntime,
-        audio_names: &mut Vec<String>,
+        audio_names: &mut [String],
         current_audio_device: &mut Option<String>,
         theme: &mut Theme,
         event: &ratatui::crossterm::event::Event,
