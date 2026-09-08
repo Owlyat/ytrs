@@ -9,11 +9,17 @@ use tracing_subscriber::fmt;
 use crate::app::{AudioFormat, Format, VideoFormat, YoutubeRs};
 use crate::cli;
 
-/// File logging setup (`ytrs.log` in the working directory).
+/// File logging setup.
+///
+/// Debug builds log to `./ytrs.log`; release builds log to
+/// `~/.config/ytrs/ytrs.log` (see [`crate::config::ytrs_config_dir`]).
 ///
 /// Returns the guard that must be kept alive for logs to be flushed.
 pub fn init_tracing() -> WorkerGuard {
-    let file_appender = tracing_appender::rolling::never(".", "ytrs.log");
+    let (dir, filename) = log_location();
+    // Ensure the directory exists (a no-op for `.`).
+    let _ = std::fs::create_dir_all(&dir);
+    let file_appender = tracing_appender::rolling::never(dir, filename);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     fmt().with_max_level(tracing::Level::DEBUG)
         .with_writer(non_blocking)
@@ -93,6 +99,18 @@ pub fn prompt_confirm(title: &str, default_yes: bool) -> Result<bool> {
             },
         }
     }
+}
+
+/// Where the log file goes, per build profile.
+#[cfg(debug_assertions)]
+fn log_location() -> (std::path::PathBuf, &'static str) {
+    (std::path::PathBuf::from("."), "ytrs.log")
+}
+
+/// Where the log file goes, per build profile.
+#[cfg(not(debug_assertions))]
+fn log_location() -> (std::path::PathBuf, &'static str) {
+    (crate::config::ytrs_config_dir(), "ytrs.log")
 }
 
 /// Wiring between the parsed CLI args and [`YoutubeRs`].

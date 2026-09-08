@@ -358,20 +358,22 @@ impl Theme {
     }
 }
 
-fn config_dir() -> PathBuf {
+/// Base config directory (`~/.config/ytrs`), Windows-aware.
+/// Used for `theme.toml`, the release-mode log file, etc.
+pub fn ytrs_config_dir() -> PathBuf {
     if cfg!(target_os = "windows") {
         PathBuf::from(env!("USERPROFILE"))
             .join(".config")
             .join("ytrs")
-            .join("theme.toml")
     } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".config")
-            .join("ytrs")
-            .join("theme.toml")
+        PathBuf::from(home).join(".config").join("ytrs")
     } else {
-        PathBuf::from("theme.toml")
+        PathBuf::from(".")
     }
+}
+
+fn config_dir() -> PathBuf {
+    ytrs_config_dir().join("theme.toml")
 }
 
 /// Parse a color string into a ratatui `Color`.
