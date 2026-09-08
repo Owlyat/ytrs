@@ -361,15 +361,9 @@ impl Theme {
 /// Base config directory (`~/.config/ytrs`), Windows-aware.
 /// Used for `theme.toml`, the release-mode log file, etc.
 pub fn ytrs_config_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        PathBuf::from(env!("USERPROFILE"))
-            .join(".config")
-            .join("ytrs")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".config").join("ytrs")
-    } else {
-        PathBuf::from(".")
-    }
+    crate::utility::home_dir()
+        .map(|home| home.join(".config").join("ytrs"))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn config_dir() -> PathBuf {

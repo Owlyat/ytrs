@@ -1961,47 +1961,20 @@ impl YoutubeRs {
     }
     #[cfg(target_os = "windows")]
     fn get_libs_path(args: &Cli) -> (PathBuf, PathBuf) {
+        let base = crate::utility::home_dir().map(|home| home.join(".config").join("ytrs"));
         let exec_dir = if let Some(libs_path) = &args.libs_path {
             libs_path.join("libs")
+        } else if let Some(base) = &base {
+            base.join("libs")
         } else {
-            if cfg!(target_os = "windows") {
-                PathBuf::from(env!("USERPROFILE"))
-                    .join(".config")
-                    .join("ytrs")
-                    .join("libs")
-            } else if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                if let Ok(home_path_str) = std::env::var("HOME") {
-                    PathBuf::from(home_path_str)
-                        .join(".config")
-                        .join("ytrs")
-                        .join("libs")
-                } else {
-                    PathBuf::from("libs")
-                }
-            } else {
-                PathBuf::from("libs")
-            }
+            PathBuf::from("libs")
         };
         let output_dir = if let Some(output) = &args.output_path {
             output.join("output")
+        } else if let Some(base) = &base {
+            base.join("output")
         } else {
-            if cfg!(target_os = "windows") {
-                PathBuf::from(env!("USERPROFILE"))
-                    .join(".config")
-                    .join("ytrs")
-                    .join("output")
-            } else if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                if let Ok(home_path_str) = std::env::var("Home") {
-                    PathBuf::from(home_path_str)
-                        .join(".config")
-                        .join("ytrs")
-                        .join("output")
-                } else {
-                    PathBuf::from("output")
-                }
-            } else {
-                PathBuf::from("output")
-            }
+            PathBuf::from("output")
         };
         (exec_dir, output_dir)
     }

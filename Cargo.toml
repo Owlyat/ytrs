@@ -1,6 +1,7 @@
 [package]
 name = "ytrs"
 version = "0.1.4"
+authors = ["Owlyat"]
 edition = "2024"
 include = [
   "src/**/*",

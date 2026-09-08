@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 pub fn format_time(d: u32) -> impl std::fmt::Display {
     let hours = d / 3600;
     let minutes = (d % 3600) / 60;
@@ -13,4 +15,15 @@ pub fn format_time(d: u32) -> impl std::fmt::Display {
         "".to_owned()
     };
     format!("[{}{}{secs:02}]", hours_str, minutes)
+}
+
+/// Home directory resolved at runtime: `%USERPROFILE%` on Windows,
+/// `$HOME` on Linux/macOS. `None` when the variable is missing
+/// (unlike `env!`, this never breaks compilation on other platforms).
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let var = "USERPROFILE";
+    #[cfg(not(target_os = "windows"))]
+    let var = "HOME";
+    std::env::var(var).ok().map(PathBuf::from)
 }
