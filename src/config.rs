@@ -4,7 +4,8 @@
 //! Colors accept named ratatui colors ("blue", "yellow") or hex ("#FF0000").
 //!
 //! File format: a `preset` key selects a built-in base (`default`,
-//! `groovebox`, `tokyonight`, `dracula`, `nord`); any color set under
+//! `groovebox`, `tokyonight`, `dracula`, `nord`, `catppuccin`, `rosepine`,
+//! `kanagawa`, `onedark`, `everforest`); any color set under
 //! `[player]` / `[sidebar]` overrides the preset.
 //!
 //! ```toml
@@ -73,7 +74,18 @@ impl Default for Theme {
 impl Theme {
     /// Built-in preset names, in cycle order.
     pub fn preset_names() -> Vec<&'static str> {
-        vec!["default", "groovebox", "tokyonight", "dracula", "nord"]
+        vec![
+            "default",
+            "groovebox",
+            "tokyonight",
+            "dracula",
+            "nord",
+            "catppuccin",
+            "rosepine",
+            "kanagawa",
+            "onedark",
+            "everforest",
+        ]
     }
 
     /// Full built-in theme (unknown names fall back to `default`).
@@ -137,6 +149,81 @@ impl Theme {
                     fg: "#eceff4".into(),
                     highlight_bg: "#88c0d0".into(),
                     highlight_fg: "#2e3440".into(),
+                },
+            ),
+            // Catppuccin Mocha.
+            "catppuccin" => (
+                PlayerTheme {
+                    bg: "#1e1e2e".into(),
+                    fg: "#cdd6f4".into(),
+                    gauge_fill: "#cba6f7".into(),
+                    gauge_bg: "#313244".into(),
+                },
+                SidebarTheme {
+                    bg: "#1e1e2e".into(),
+                    fg: "#cdd6f4".into(),
+                    highlight_bg: "#89b4fa".into(),
+                    highlight_fg: "#11111b".into(),
+                },
+            ),
+            // Rosé Pine.
+            "rosepine" => (
+                PlayerTheme {
+                    bg: "#191724".into(),
+                    fg: "#e0def4".into(),
+                    gauge_fill: "#ebbcba".into(),
+                    gauge_bg: "#26233a".into(),
+                },
+                SidebarTheme {
+                    bg: "#191724".into(),
+                    fg: "#e0def4".into(),
+                    highlight_bg: "#c4a7e7".into(),
+                    highlight_fg: "#191724".into(),
+                },
+            ),
+            // Kanagawa Wave.
+            "kanagawa" => (
+                PlayerTheme {
+                    bg: "#1f1f28".into(),
+                    fg: "#dcd7ba".into(),
+                    gauge_fill: "#7e9cd8".into(),
+                    gauge_bg: "#223249".into(),
+                },
+                SidebarTheme {
+                    bg: "#1f1f28".into(),
+                    fg: "#dcd7ba".into(),
+                    highlight_bg: "#7e9cd8".into(),
+                    highlight_fg: "#1f1f28".into(),
+                },
+            ),
+            // One Dark.
+            "onedark" => (
+                PlayerTheme {
+                    bg: "#282c34".into(),
+                    fg: "#abb2bf".into(),
+                    gauge_fill: "#61afef".into(),
+                    gauge_bg: "#3e4451".into(),
+                },
+                SidebarTheme {
+                    bg: "#282c34".into(),
+                    fg: "#abb2bf".into(),
+                    highlight_bg: "#61afef".into(),
+                    highlight_fg: "#282c34".into(),
+                },
+            ),
+            // Everforest Dark.
+            "everforest" => (
+                PlayerTheme {
+                    bg: "#2b3339".into(),
+                    fg: "#d3c6aa".into(),
+                    gauge_fill: "#a7c080".into(),
+                    gauge_bg: "#323c41".into(),
+                },
+                SidebarTheme {
+                    bg: "#2b3339".into(),
+                    fg: "#d3c6aa".into(),
+                    highlight_bg: "#a7c080".into(),
+                    highlight_fg: "#2b3339".into(),
                 },
             ),
             // Historical default (also used for unknown names).
@@ -350,6 +437,27 @@ mod tests {
         // Unknown names fall back to default (and keep the requested name out).
         let fallback = Theme::preset("nope");
         assert_eq!(fallback.player.bg, Theme::preset("default").player.bg);
+    }
+
+    #[test]
+    fn every_preset_is_complete() {
+        // Guards future additions: each listed name resolves to full tables.
+        for name in Theme::preset_names() {
+            let theme = Theme::preset(name);
+            assert_eq!(theme.preset, name, "preset name mismatch");
+            for color in [
+                &theme.player.bg,
+                &theme.player.fg,
+                &theme.player.gauge_fill,
+                &theme.player.gauge_bg,
+                &theme.sidebar.bg,
+                &theme.sidebar.fg,
+                &theme.sidebar.highlight_bg,
+                &theme.sidebar.highlight_fg,
+            ] {
+                assert!(!color.is_empty(), "preset {name} has an empty color");
+            }
+        }
     }
 
     #[test]
